@@ -228,4 +228,16 @@ python main.py --seed 42 --backbone cifar100_resnet20 --dataset pathmnist \
 
 ## Citation
 
-If you use this code, please cite the accompanying paper.
+If you use this code, please cite the accompanying paper:
+
+```bibtex
+@article{anonymous2026dpfedsofim,
+  title   = {{DP}-Fed{SOFIM}: Differentially Private Federated Stochastic Optimization
+             using Regularized Fisher Information Matrix},
+  author  = {Anonymous},
+  journal = {Submitted to Transactions on Machine Learning Research},
+  year    = {2026},
+  url     = {https://openreview.net/forum?id=aDzj9DrwAR},
+  note    = {Under review}
+}
+```
