@@ -24,8 +24,6 @@ DP-FedSOFIM trains a linear classifier on top of a frozen, pre-trained ResNet ba
 | [sanitizer.py](sanitizer.py) | DP noise mechanisms for all algorithms |
 | [hockey_stick_accountant.py](hockey_stick_accountant.py) | Exact Gaussian DP accountant (hockey-stick divergence) |
 | [dataset.py](dataset.py) | Feature extraction, federated data partitioning (IID / non-IID / Dirichlet) |
-| [run_dp_fedgd_experiments.py](run_dp_fedgd_experiments.py) | Batch experiment sweep runner |
-| [run_hyperparam_search.py](run_hyperparam_search.py) | Coarse-to-fine hyperparameter search |
 | [plot_comparison_accuracycurves.py](plot_comparison_accuracycurves.py) | Accuracy curve plotting across algorithms |
 | [plot_comparison_losscurves.py](plot_comparison_losscurves.py) | Loss curve plotting across algorithms |
 
