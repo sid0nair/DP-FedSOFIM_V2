@@ -33,9 +33,10 @@ from dataset import (
     get_federated_pathmnist_features,
     get_federated_bloodmnist_features,
     get_federated_dermamnist_features,
+    get_federated_tinyimagenet_features,
 )
 
-from sanitizer import DPFedGDSanitizer, DPFedNewSanitizer, DPFedFCSanitizer, DPFedScaffoldSanitizer
+from sanitizer import DPFedGDSanitizer, DPFedNewSanitizer, DPFedFCSanitizer, DPFedScaffoldSanitizer, DPFedFTRLSanitizer
 
 def parse_args():
     p = argparse.ArgumentParser(description="Record-Level DP-FedGD (Algorithm 5) on CIFAR-10 and MedMNIST")
@@ -43,7 +44,8 @@ def parse_args():
     # Model
     p.add_argument("--backbone", type=str, default="cifar100_resnet20",
                    choices=["resnet20", "resnet32", "resnet44", "resnet56",
-                            "cifar100_resnet20", "cifar100_resnet56"],
+                            "cifar100_resnet20", "cifar100_resnet56",
+                            "cifar100_vgg16_bn"],
                    help="Backbone architecture (chenyaofo CIFAR-pretrained)")
 
     # Federated setup
@@ -62,7 +64,8 @@ def parse_args():
         "--dataset",
         type=str,
         default="cifar10",
-        choices=["cifar10", "cifar10_binary", "chestmnist", "pathmnist", "bloodmnist", "dermamnist"],
+        choices=["cifar10", "cifar10_binary", "chestmnist", "pathmnist", "bloodmnist", "dermamnist",
+                 "tinyimagenet"],
         help="Dataset to use for federated training."
     )
     p.add_argument("--partition_type", type=str, default="iid",
@@ -123,6 +126,10 @@ def parse_args():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--sofim_warmup_rounds", type=int, default=20,
                    help="Number of rounds to use SGD before switching to SOFIM")
+    p.add_argument("--sofim_warmup_use_ftrl", action="store_true",
+                   help="Use DP-FTRL (binary tree) update rule during SOFIM warmup rounds instead of "
+                        "DP-FedGD/EMA. Reduces effective compositions from T to "
+                        "ceil(log2(warmup))+1 + (T-warmup), giving lower noise for the same budget.")
     p.add_argument("--sofim_ablation_mode", type=str, default="full",
                    choices=["full", "ema_only", "grad_only"],
                    help="SOFIM ablation: full=SOFIM, ema_only=EMA no SM, grad_only=raw gradient")
@@ -168,12 +175,27 @@ def parse_args():
 
     p.add_argument("--use_fedprox", action="store_true",
                    help="Use DP-FedProx with proximal penalty")
+    p.add_argument("--use_adafedprox", action="store_true",
+                   help="Use DP-AdaFedProx: FedProx with diminishing proximal term "
+                        "mu_t = max(mu_0 / sqrt(t), 0.1 * mu_0). Reuses --fedprox_* params.")
     p.add_argument("--fedprox_mu", type=float, default=0.01,
-                   help="Proximal penalty coefficient mu for FedProx")
+                   help="Initial proximal penalty mu_0 (FedProx / AdaFedProx)")
     p.add_argument("--fedprox_local_steps", type=int, default=5,
-                   help="Number of local steps K for FedProx")
+                   help="Number of local steps K for FedProx / AdaFedProx")
     p.add_argument("--fedprox_client_lr", type=float, default=0.1,
-                   help="Local learning rate for FedProx")
+                   help="Local learning rate for FedProx / AdaFedProx")
+
+    p.add_argument("--use_ftrl", action="store_true",
+                   help="Use DP-FTRL with binary tree aggregation (Kairouz et al., ICML 2021). "
+                        "Calibrates noise to O(log T) effective compositions instead of T, "
+                        "giving sqrt(T/log T) noise reduction vs DP-FedGD.")
+
+    # Tiny-ImageNet subset
+    p.add_argument("--tinyimagenet_classes", type=int, default=50,
+                   help="Number of classes to use from Tiny-ImageNet (default 50). "
+                        "Random subset selected with --tinyimagenet_subset_seed.")
+    p.add_argument("--tinyimagenet_subset_seed", type=int, default=0,
+                   help="Fixed seed for Tiny-ImageNet class subset selection (default 0).")
 
     return p.parse_args()
 # --- DP-SCAFFOLD Client Implementation ---
@@ -254,7 +276,11 @@ class DPFedGDClient:
         factor_sum = 0.0
         total_count = 0
 
-        batch_size = min(64, self.num_samples)
+        # Auto-scale batch size so batch_grads never exceeds ~8 MB of GPU RAM.
+        # For VGG16 + 200 classes: grad_dim=102,600 → batch≈20 (8 MB).
+        # For ResNet20 + 10 classes: grad_dim=650 → batch=64 (normal).
+        grad_dim = (self.feature_dim + 1) * (self.num_classes if self.num_classes > 1 else 1)
+        batch_size = min(self.num_samples, max(4, (8 * 1024 * 1024) // (grad_dim * 4)))
         num_batches = (self.num_samples + batch_size - 1) // batch_size
 
         for batch_idx in range(num_batches):
@@ -329,15 +355,11 @@ class DPFedGDClient:
         Vectorized computation of per-example gradients.
         Eliminates the slow Python loop over batch_size.
         """
-        batch_size = X.size(0)
-
-        # 1. Add bias term to inputs efficiently (same as LinearClassifier forward)
-        ones = torch.ones(batch_size, 1, device=self.device, dtype=X.dtype)
-        X_with_bias = torch.cat([X, ones], dim=1)  # Shape: [B, feature_dim + 1]
-
-        # 2. Forward pass (all samples at once)
-        # self.model.w shape: [feature_dim + 1, num_classes]
-        logits = X_with_bias @ self.model.w
+        with torch.no_grad():  # ← add this
+            batch_size = X.size(0)
+            ones = torch.ones(batch_size, 1, device=self.device, dtype=X.dtype)
+            X_with_bias = torch.cat([X, ones], dim=1)
+            logits = X_with_bias @ self.model.w
 
         # 3. Compute Errors (dL/dz) and Gradients efficiently
         if self.num_classes == 1:
@@ -386,7 +408,8 @@ class DPFedGDClient:
         self.model.set_weights(weights)
         self.model.train()
 
-        batch_size = min(64, self.num_samples)
+        grad_dim = (self.feature_dim + 1) * (self.num_classes if self.num_classes > 1 else 1)
+        batch_size = min(self.num_samples, max(4, (8 * 1024 * 1024) // (grad_dim * 4)))
         num_batches = (self.num_samples + batch_size - 1) // batch_size
 
         Cg = float(sanitizer.gradient_clip_norm) if sanitizer is not None else None
@@ -688,11 +711,13 @@ class DPFedGDServer:
             'learning_rate': self.learning_rate
         }
 
-    def evaluate(self, test_loader: DataLoader, is_binary: bool) -> Dict[str, float]:
+    def evaluate(self, test_loader: DataLoader, is_binary: bool,
+                 return_mask: bool = False) -> Dict[str, float]:
         """Evaluate global model."""
         self.global_model.eval()
         correct = total = total_loss = 0
         tp = fp = tn = fn = 0
+        correct_mask = []
 
         with torch.no_grad():
             for X, y in test_loader:
@@ -702,18 +727,20 @@ class DPFedGDServer:
                 if is_binary:
                     probs = torch.sigmoid(logits)
                     preds = (probs > 0.5).float()
-                    correct += (preds == y.float()).sum().item()
+                    batch_correct = (preds == y.float())
+                    correct += batch_correct.sum().item()
                     loss = F.binary_cross_entropy_with_logits(logits, y.float())
-                    # Confusion matrix components
                     tp += ((preds == 1) & (y == 1)).sum().item()
                     tn += ((preds == 0) & (y == 0)).sum().item()
                     fp += ((preds == 1) & (y == 0)).sum().item()
                     fn += ((preds == 0) & (y == 1)).sum().item()
                 else:
                     preds = torch.argmax(logits, dim=1)
-                    correct += (preds == y).sum().item()
+                    batch_correct = (preds == y)
+                    correct += batch_correct.sum().item()
                     loss = F.cross_entropy(logits, y.long())
 
+                correct_mask.extend(batch_correct.cpu().tolist())
                 total += X.size(0)
                 total_loss += loss.item() * X.size(0)
 
@@ -724,7 +751,7 @@ class DPFedGDServer:
             recall_pos = tp / (tp + fn + 1e-12)
             precision_pos = tp / (tp + fp + 1e-12)
             f1_pos = 2 * precision_pos * recall_pos / (precision_pos + recall_pos + 1e-12)
-            return {
+            result = {
                 'accuracy': accuracy,
                 'loss': avg_loss,
                 'recall_pos': recall_pos,
@@ -736,10 +763,14 @@ class DPFedGDServer:
                 'fn': fn,
             }
         else:
-            return {
+            result = {
                 'accuracy': correct / total,
-                'loss': total_loss / total
+                'loss': total_loss / total,
             }
+
+        if return_mask:
+            result['test_correct_mask'] = correct_mask
+        return result
 
 class DPFedScaffoldServer(DPFedGDServer):
     """Server for record-level full-batch DP-SCAFFOLD (Algorithm 2)."""
@@ -814,7 +845,8 @@ class DPFedGDServerSOFIM:
                  use_bias_correction: bool = True,
                  warmup_rounds: int = 0,
                  ablation_mode: str = "full",
-                 weight_decay: float = 0.0):
+                 weight_decay: float = 0.0,
+                 warmup_use_ftrl: bool = False):
         """
         Initialize SOFIM server.
 
@@ -852,6 +884,14 @@ class DPFedGDServerSOFIM:
         # Model dimension
         self.d = (feature_dim + 1) * (num_classes if num_classes > 1 else 1)
 
+        # DP-FTRL warmup state (only used when warmup_use_ftrl=True)
+        self.warmup_use_ftrl = warmup_use_ftrl
+        if warmup_use_ftrl:
+            self.theta_0 = self.global_model.get_weights().clone().detach()
+            self._tree_stack: List[tuple] = []
+            self._prefix_sum: Optional[torch.Tensor] = None
+            self._ftrl_round = 0
+
     def get_global_weights(self) -> torch.Tensor:
         """Get current global model weights."""
         return self.global_model.get_weights()
@@ -882,7 +922,7 @@ class DPFedGDServerSOFIM:
             aggregated_gradient = torch.stack(client_updates).mean(dim=0)
 
         # Flatten to vector form
-        gt = aggregated_gradient.view(-1)  # [d]
+        gt = aggregated_gradient.view(-1).detach()  # [d]
 
         # Step 2: Update first moment (momentum)
         if self.M is None:
@@ -898,33 +938,47 @@ class DPFedGDServerSOFIM:
             Mct = self.M.clone()
 
         # Step 4: Apply SOFIM preconditioner using Sherman-Morrison formula
+        is_warmup = False
+        is_ftrl_warmup = False
+        preconditioned_update = None
+
         if self.ablation_mode == "grad_only":
             # Raw gradient — no EMA, no SM (equivalent to FedGD)
             preconditioned_update = gt
-            is_warmup = False
         elif self.ablation_mode == "ema_only":
             # EMA momentum only — no Sherman-Morrison step
             preconditioned_update = Mct
-            is_warmup = False
         elif current_round <= self.warmup_rounds:
-            # Warmup: use EMA only before enabling full SOFIM
-            preconditioned_update = Mct
             is_warmup = True
+            if self.warmup_use_ftrl:
+                # FTRL warmup: binary tree prefix-sum update
+                is_ftrl_warmup = True
+                self._ftrl_round += 1
+                self._tree_push(gt)
+            else:
+                # EMA-only warmup (original behaviour)
+                preconditioned_update = Mct
         else:
             # Full SOFIM: EMA + Sherman-Morrison
             preconditioned_update = self._apply_sofim_preconditioner(Mct)
-            is_warmup = False
 
         # Step 5: Update model weights
         global_weights = self.get_global_weights()
-        if self.weight_decay > 0.0:
-            # L2 reg: effective update = preconditioned_update + λ·θ
-            preconditioned_update = preconditioned_update + self.weight_decay * global_weights
-        new_weights = global_weights - self.learning_rate * preconditioned_update
-        self.global_model.set_weights(new_weights)
+        if is_ftrl_warmup:
+            # θ = θ_0 - η * running_mean(all warmup gradients)
+            running_mean = self._prefix_sum / self._ftrl_round
+            new_weights = self.theta_0 - self.learning_rate * running_mean
+            update_norm = running_mean.norm().item()
+            tree_depth = max((h for h, _ in self._tree_stack), default=0)
+        else:
+            if self.weight_decay > 0.0:
+                # L2 reg: effective update = preconditioned_update + λ·θ
+                preconditioned_update = preconditioned_update + self.weight_decay * global_weights
+            new_weights = global_weights - self.learning_rate * preconditioned_update
+            update_norm = preconditioned_update.norm().item()
+            tree_depth = 0
 
-        # Compute statistics
-        update_norm = preconditioned_update.norm().item()
+        self.global_model.set_weights(new_weights)
         weight_change = (new_weights - global_weights).norm().item()
 
         return {
@@ -932,6 +986,8 @@ class DPFedGDServerSOFIM:
             'weight_change_norm': weight_change,
             'gradient_norm': gt.norm().item(),
             'is_warmup': is_warmup,
+            'is_ftrl_warmup': is_ftrl_warmup,
+            'ftrl_tree_depth': tree_depth,
             'moment_norm': self.M.norm().item(),
             'moment_corrected_norm': Mct.norm().item(),
             'bias_correction_factor': (1.0 - self.beta ** self.step_count),
@@ -939,48 +995,91 @@ class DPFedGDServerSOFIM:
         }
 
 
+    def _tree_push(self, gradient: torch.Tensor) -> None:
+        """Insert a new leaf into the streaming binary tree (Honaker 2015)."""
+        node = gradient.clone()
+        height = 0
+        while self._tree_stack and self._tree_stack[-1][0] == height:
+            _, prev = self._tree_stack.pop()
+            node = prev + node
+            height += 1
+        self._tree_stack.append((height, node))
+        self._prefix_sum = sum(v for _, v in self._tree_stack)
+
     def _apply_sofim_preconditioner(self, Mct: torch.Tensor) -> torch.Tensor:
         """
-        Apply SOFIM preconditioner using Sherman-Morrison formula.
+        Apply SOFIM preconditioner using the Sherman-Morrison formula.
 
-        From Algorithm 1 in SOFIM paper:
-        Ft = Mct·Mct^T + ρ·I
-        Ft^(-1)·Mct = Mct/ρ - (Mct·Mct^T·Mct)/(ρ²(1 + Mct^T·Mct/ρ))
+        SOFIM uses the rank-1 Fisher approximation
 
-        This avoids explicitly forming the d×d matrix Ft.
+            F_t = Mct Mct^T + rho I
+
+        and computes
+
+            F_t^{-1} Mct
+
+        without explicitly forming or inverting the d×d matrix F_t.
+
+        Using Sherman-Morrison:
+
+            (rho I + uu^T)^{-1}
+                = (1/rho)I
+                  - uu^T / (rho^2 * (1 + u^T u / rho))
+
+        where u = Mct.
+
+        Therefore,
+
+            F_t^{-1} Mct
+                = Mct/rho
+                  - (Mct (Mct^T Mct))
+                    / (rho^2 (1 + Mct^T Mct / rho))
 
         Args:
-            Mct: Bias-corrected first moment vector [d]
+            Mct: Bias-corrected first-moment vector.
 
         Returns:
-            Preconditioned update direction [d]
+            Preconditioned update direction.
         """
-        # First term: Mct / ρ
+
+        # First term: Mct / rho
         term1 = Mct / self.rho
 
-        # Second term: (Mct·Mct^T·Mct) / (ρ²(1 + Mct^T·Mct/ρ))
-        # Mct^T·Mct is a scalar (squared norm)
+        # Squared norm ||Mct||² = Mct^T Mct
         Mct_norm_sq = torch.dot(Mct, Mct)
 
-        # Numerator: Mct · (Mct^T·Mct) = Mct · Mct_norm_sq
+        # Second Sherman-Morrison correction term
         numerator = Mct * Mct_norm_sq
-
-        # Denominator: ρ²(1 + Mct^T·Mct/ρ)
         denominator = self.rho ** 2 * (1.0 + Mct_norm_sq / self.rho)
 
-        # Second term
-        term2 = numerator / (denominator + 1e-8)  # Add epsilon for numerical stability
+        term2 = numerator / (denominator + 1e-8)
 
-        # Final preconditioned update: Ft^(-1)·Mct
+        # Final preconditioned direction
         preconditioned = term1 - term2
+
+        # Diagnostics (every 10 rounds)
+        if hasattr(self, "step_count") and self.step_count % 10 == 0:
+            precond_norm = torch.norm(preconditioned).item()
+            moment_norm = torch.norm(Mct).item()
+
+            print(
+                f"[SOFIM] "
+                f"moment={moment_norm:.3e}, "
+                f"precond={precond_norm:.3e}, "
+                f"ratio={precond_norm / (moment_norm + 1e-12):.3e}, "
+                f"rho={self.rho:.3e}, "
+                f"norm_sq={Mct_norm_sq.item():.3e}"
+            )
 
         return preconditioned
 
-    def evaluate(self, test_loader: DataLoader, is_binary: bool) -> Dict[str, float]:
+    def evaluate(self, test_loader: DataLoader, is_binary: bool,
+                 return_mask: bool = False) -> Dict[str, float]:
         """Evaluate global model on test set."""
         self.global_model.eval()
         correct = total = total_loss = 0
         tp = fp = tn = fn = 0
+        correct_mask = []
 
         with torch.no_grad():
             for X, y in test_loader:
@@ -990,7 +1089,8 @@ class DPFedGDServerSOFIM:
                 if is_binary:
                     probs = torch.sigmoid(logits)
                     preds = (probs > 0.5).float()
-                    correct += (preds == y.float()).sum().item()
+                    batch_correct = (preds == y.float())
+                    correct += batch_correct.sum().item()
                     loss = F.binary_cross_entropy_with_logits(logits, y.float())
                     tp += ((preds == 1) & (y == 1)).sum().item()
                     tn += ((preds == 0) & (y == 0)).sum().item()
@@ -998,9 +1098,11 @@ class DPFedGDServerSOFIM:
                     fn += ((preds == 0) & (y == 1)).sum().item()
                 else:
                     preds = torch.argmax(logits, dim=1)
-                    correct += (preds == y).sum().item()
+                    batch_correct = (preds == y)
+                    correct += batch_correct.sum().item()
                     loss = F.cross_entropy(logits, y.long())
 
+                correct_mask.extend(batch_correct.cpu().tolist())
                 total += X.size(0)
                 total_loss += loss.item() * X.size(0)
 
@@ -1011,22 +1113,23 @@ class DPFedGDServerSOFIM:
             recall_pos = tp / (tp + fn + 1e-12)
             precision_pos = tp / (tp + fp + 1e-12)
             f1_pos = 2 * precision_pos * recall_pos / (precision_pos + recall_pos + 1e-12)
-            return {
+            result = {
                 'accuracy': accuracy,
                 'loss': avg_loss,
                 'recall_pos': recall_pos,
                 'precision_pos': precision_pos,
                 'f1_pos': f1_pos,
-                'tp': tp,
-                'fp': fp,
-                'tn': tn,
-                'fn': fn,
+                'tp': tp, 'fp': fp, 'tn': tn, 'fn': fn,
             }
         else:
-            return {
+            result = {
                 'accuracy': correct / total,
-                'loss': total_loss / total
+                'loss': total_loss / total,
             }
+
+        if return_mask:
+            result['test_correct_mask'] = correct_mask
+        return result
 
 class DPFedAdamServer(DPFedGDServer):
     """
@@ -1053,7 +1156,7 @@ class DPFedAdamServer(DPFedGDServer):
                               sanitizer=None) -> Dict:
         # Aggregate
         if sanitizer is not None:
-            g = sanitizer.aggregate_client_updates(client_updates)
+            g = sanitizer.aggregate_client_updates(client_updates).detach()
         else:
             g = torch.stack(client_updates).mean(dim=0)
 
@@ -1111,7 +1214,7 @@ class DPFedYogiServer(DPFedGDServer):
     def aggregate_and_update(self, client_updates: List[torch.Tensor],
                               sanitizer=None) -> Dict:
         if sanitizer is not None:
-            g = sanitizer.aggregate_client_updates(client_updates)
+            g = sanitizer.aggregate_client_updates(client_updates).detach()
         else:
             g = torch.stack(client_updates).mean(dim=0)
 
@@ -1141,6 +1244,80 @@ class DPFedYogiServer(DPFedGDServer):
             'weight_change_norm': float((new_w - old_w).norm().item()),
             'learning_rate': self.learning_rate,
         }
+
+class DPFedFTRLServer(DPFedGDServer):
+    """
+    Server implementing DP-FTRL with binary tree aggregation.
+
+    Kairouz et al., "Practical and Private (Deep) Learning without Auditing",
+    ICML 2021.
+
+    Two changes vs DP-FedGD:
+    1. FTRL update rule: θ_{t+1} = θ_0 - η * (1/t) Σ_{i=1}^t g_i
+       Uses the running mean of ALL past gradients instead of only the current one.
+       This averages out DP noise over time and is more stable under high noise.
+    2. Binary tree prefix-sum accumulation (Honaker 2015): gradients are summed
+       via a streaming binary tree so that each training example participates in
+       only O(log T) tree nodes.  Paired with DPFedFTRLSanitizer (which calibrates
+       noise to T_eff = ceil(log2 T)+1 compositions), this gives sqrt(T/log T)
+       noise reduction over DP-FedGD for the same privacy budget.
+    """
+
+    def __init__(self, feature_dim: int, num_classes: int,
+                 learning_rate: float, device: torch.device):
+        super().__init__(feature_dim, num_classes, learning_rate, device)
+        # FTRL anchor: regularisation centre (initial weights)
+        self.theta_0 = self.global_model.get_weights().clone().detach()
+        self._round = 0
+        # Streaming binary tree state: list of (height, partial_sum) pairs
+        self._tree_stack: List[tuple] = []
+        self._prefix_sum: Optional[torch.Tensor] = None
+
+    def _tree_push(self, gradient: torch.Tensor) -> None:
+        """
+        Insert a new leaf into the streaming binary tree and update prefix sum.
+
+        Implements the binary-counter approach (Honaker 2015): two nodes of the
+        same height are merged into one node of height+1, exactly like carrying
+        a bit in binary addition.  No extra noise is added here — all noise is
+        already present in `gradient` from the client-side mechanism.
+        """
+        node = gradient.clone()
+        height = 0
+        while self._tree_stack and self._tree_stack[-1][0] == height:
+            _, prev = self._tree_stack.pop()
+            node = prev + node
+            height += 1
+        self._tree_stack.append((height, node))
+        self._prefix_sum = sum(v for _, v in self._tree_stack)
+
+    def aggregate_and_update(self, client_updates: List[torch.Tensor],
+                              sanitizer=None) -> Dict:
+        self._round += 1
+
+        # Standard server-side aggregation (noise already in client updates)
+        if sanitizer is not None:
+            g_t = sanitizer.aggregate_client_updates(client_updates)
+        else:
+            g_t = torch.stack(client_updates).mean(dim=0)
+
+        # Accumulate via binary tree (O(log T) structure for noise accounting)
+        self._tree_push(g_t)
+
+        # FTRL update: θ = θ_0 - η * running_mean_of_all_gradients
+        running_mean = self._prefix_sum / self._round
+        old_w = self.get_global_weights()
+        new_w = self.theta_0 - self.learning_rate * running_mean
+        self.global_model.set_weights(new_w)
+
+        tree_depth = max((h for h, _ in self._tree_stack), default=0)
+        return {
+            'update_norm': float(running_mean.norm().item()),
+            'weight_change_norm': float((new_w - old_w).norm().item()),
+            'learning_rate': self.learning_rate,
+            'ftrl_tree_depth': tree_depth,
+        }
+
 
 def compute_lemma4_xi(a: torch.Tensor, b: torch.Tensor, C: float) -> float:
     """
@@ -1516,142 +1693,132 @@ import torch
 import numpy as np
 
 
-def compute_fisher_alignment(
-        clients, global_weights, momentum_buffer, device,
-        max_clients=10, power_iter=40, trace_probe=30):
-
-    subset = clients[:min(max_clients, len(clients))]
-    num_classes = subset[0].num_classes
-    d = momentum_buffer.numel()
-    m = momentum_buffer.flatten().float().to(device)
-
-    if m.norm() < 1e-12:
-        return {
-            'fisher_cosine_sim': 0, 'fisher_spectral_gap': 1,
-            'fisher_variance_explained': 0, 'fisher_lambda1': 0, 'fisher_lambda2': 0
-        }
-
-    client_data = []
-    total_n = 0
-
-    for client in subset:
-        n_i = client.num_samples
-        # Move to GPU only for this computation, then release
-        X = client.features.float().to(device)
-        ones = torch.ones(n_i, 1, device=device)
-        X_wb = torch.cat([X, ones], dim=1)
-        del X  # free immediately after augmenting
-
-        d_feat1 = X_wb.shape[1]
-        C = num_classes if num_classes > 1 else 1
-        W = global_weights.view(d_feat1, C).float()
-
-        with torch.no_grad():
-            logits = X_wb @ W
-            if num_classes == 1:
-                p = torch.sigmoid(logits)
-            else:
-                p = torch.softmax(logits, dim=1)
-
-        del logits, W
-        client_data.append((X_wb, p, n_i))
-        total_n += n_i
-
-    def fisher_vec_product(v):
-        if num_classes == 1:
-            Fv = torch.zeros_like(v)
-            for X, p, n_i in client_data:
-                Xv = X @ v
-                w = (p * (1 - p)).squeeze()
-                Fv += X.T @ (w * Xv)
-            return Fv / total_n
-        else:
-            d_feat1 = client_data[0][0].shape[1]
-            C = num_classes
-            V = v.view(d_feat1, C)
-            Fv = torch.zeros_like(V)
-            for X, p, n_i in client_data:
-                XV = X @ V
-                term1 = p * XV
-                term2 = p * (p * XV).sum(dim=1, keepdim=True)
-                Fv += X.T @ (term1 - term2)
-            return Fv.flatten() / total_n
-
-    # Top eigenvector
-    v1 = m / m.norm()
-    prev = 0
-    lam = torch.tensor(0.0, device=device)
-    for i in range(power_iter):
-        with torch.no_grad():
-            Fv = fisher_vec_product(v1)
-        norm = Fv.norm()
-        if norm < 1e-12:
-            break
-        v1 = Fv / norm
-        with torch.no_grad():
-            lam = torch.dot(v1, fisher_vec_product(v1))
-        if abs(lam.item() - prev) < 1e-8:
-            break
-        prev = lam.item()
-
-    lambda1 = lam.item()
-
-    # lambda2
-    v2 = torch.randn_like(v1)
-    v2 -= torch.dot(v2, v1) * v1
-    v2 = v2 / v2.norm()
-    prev = 0
-    lam2 = torch.tensor(0.0, device=device)
-    for i in range(power_iter):
-        with torch.no_grad():
-            Fv2 = fisher_vec_product(v2)
-        Fv2 -= torch.dot(v1, Fv2) * v1
-        norm = Fv2.norm()
-        if norm < 1e-12:
-            break
-        v2 = Fv2 / norm
-        with torch.no_grad():
-            lam2 = torch.dot(v2, fisher_vec_product(v2))
-        if abs(lam2.item() - prev) < 1e-8:
-            break
-        prev = lam2.item()
-
-    lambda2 = lam2.item()
-
-    # Trace estimate
-    trace = 0
-    for _ in range(trace_probe):
-        z = torch.randint(0, 2, (d,), device=device).float()
-        z = 2 * z - 1
-        with torch.no_grad():
-            trace += torch.dot(z, fisher_vec_product(z))
-    trace /= trace_probe
-    trace = max(trace.item(), 1e-12)
-
-    cosine = float(abs(torch.dot(m / m.norm(), v1)).item())
-    spectral_gap = max(lambda1 / max(lambda2, 1e-12), 1.0)
-    variance = min(lambda1 / trace, 1.0)
-
-    print("\nFisher diagnostics")
-    print("---------------------")
-    print("dim =", d)
-    print("lambda1 =", lambda1)
-    print("lambda2 =", lambda2)
-    print("gap =", spectral_gap)
-    print("variance explained =", variance)
-    print("cos(M,v1) =", cosine)
-
-    # --- Free all GPU tensors before returning ---
-    del client_data, v1, v2, m
-    torch.cuda.empty_cache()
-
-    return {
-        'fisher_cosine_sim': cosine,
-        'fisher_spectral_gap': spectral_gap,
-        'fisher_variance_explained': variance,
-        'fisher_lambda1': lambda1,
-        'fisher_lambda2': lambda2
-    }
+# def compute_fisher_alignment(
+#         clients, global_weights, momentum_buffer, device,
+#         max_clients=10, power_iter=40, trace_probe=30):
+#
+#     subset = clients[:min(max_clients, len(clients))]
+#     num_classes = subset[0].num_classes
+#     d = momentum_buffer.numel()
+#     m = momentum_buffer.flatten().float().to(device)
+#
+#     if m.norm() < 1e-12:
+#         return {
+#             'fisher_cosine_sim': 0, 'fisher_spectral_gap': 1,
+#             'fisher_variance_explained': 0, 'fisher_lambda1': 0, 'fisher_lambda2': 0
+#         }
+#
+#     client_data = []
+#     total_n = 0
+#
+#     for client in subset:
+#         n_i = client.num_samples
+#         X = client.features.float()  # keep on CPU
+#         ones = torch.ones(n_i, 1)
+#         X_wb = torch.cat([X, ones], dim=1)  # CPU
+#         del X
+#
+#         d_feat1 = X_wb.shape[1]
+#         C = num_classes if num_classes > 1 else 1
+#         W = global_weights.view(d_feat1, C).float().cpu()
+#
+#         with torch.no_grad():
+#             logits = X_wb @ W
+#             p = torch.softmax(logits, dim=1) if num_classes > 1 else torch.sigmoid(logits)
+#
+#         del logits, W
+#         client_data.append((X_wb, p, n_i))  # all CPU
+#         total_n += n_i
+#
+#     def fisher_vec_product(v):
+#         C = num_classes if num_classes > 1 else 1
+#         V = v.view(-1, C)
+#         Fv = torch.zeros_like(V)
+#         for X, p, n_i in client_data:
+#             X_g = X.to(device)
+#             p_g = p.to(device)
+#             XV = X_g @ V
+#             term1 = p_g * XV
+#             term2 = p_g * (p_g * XV).sum(dim=1, keepdim=True)
+#             Fv += X_g.T @ (term1 - term2)
+#             del X_g, p_g, XV, term1, term2
+#         return Fv.flatten() / total_n  # ← moved inside fisher_vec_product
+#
+#     # Top eigenvector
+#     v1 = m / m.norm()
+#     prev = 0
+#     lam = torch.tensor(0.0, device=device)
+#     for i in range(power_iter):
+#         with torch.no_grad():
+#             Fv = fisher_vec_product(v1)
+#         norm = Fv.norm()
+#         if norm < 1e-12:
+#             break
+#         v1 = Fv / norm
+#         with torch.no_grad():
+#             lam = torch.dot(v1, fisher_vec_product(v1))
+#         if abs(lam.item() - prev) < 1e-8:
+#             break
+#         prev = lam.item()
+#
+#     lambda1 = lam.item()
+#
+#     # lambda2
+#     v2 = torch.randn_like(v1)
+#     v2 -= torch.dot(v2, v1) * v1
+#     v2 = v2 / v2.norm()
+#     prev = 0
+#     lam2 = torch.tensor(0.0, device=device)
+#     for i in range(power_iter):
+#         with torch.no_grad():
+#             Fv2 = fisher_vec_product(v2)
+#         Fv2 -= torch.dot(v1, Fv2) * v1
+#         norm = Fv2.norm()
+#         if norm < 1e-12:
+#             break
+#         v2 = Fv2 / norm
+#         with torch.no_grad():
+#             lam2 = torch.dot(v2, fisher_vec_product(v2))
+#         if abs(lam2.item() - prev) < 1e-8:
+#             break
+#         prev = lam2.item()
+#
+#     lambda2 = lam2.item()
+#
+#     # Trace estimate
+#     trace = 0
+#     for _ in range(trace_probe):
+#         z = torch.randint(0, 2, (d,), device=device).float()
+#         z = 2 * z - 1
+#         with torch.no_grad():
+#             trace += torch.dot(z, fisher_vec_product(z))
+#     trace /= trace_probe
+#     trace = max(trace.item(), 1e-12)
+#
+#     cosine = float(abs(torch.dot(m / m.norm(), v1)).item())
+#     spectral_gap = max(lambda1 / max(lambda2, 1e-12), 1.0)
+#     variance = min(lambda1 / trace, 1.0)
+#
+#     print("\nFisher diagnostics")
+#     print("---------------------")
+#     print("dim =", d)
+#     print("lambda1 =", lambda1)
+#     print("lambda2 =", lambda2)
+#     print("gap =", spectral_gap)
+#     print("variance explained =", variance)
+#     print("cos(M,v1) =", cosine)
+#
+#     # --- Free all GPU tensors before returning ---
+#     del client_data, v1, v2, m
+#     torch.cuda.empty_cache()
+#
+#     return {
+#         'fisher_cosine_sim': cosine,
+#         'fisher_spectral_gap': spectral_gap,
+#         'fisher_variance_explained': variance,
+#         'fisher_lambda1': lambda1,
+#         'fisher_lambda2': lambda2
+#     }
 
 # def compute_fisher_alignment(clients, global_weights, momentum_buffer, device, max_clients=10):
 #     """
@@ -1893,6 +2060,22 @@ def run_dpfedgd_training(args):
         )
         is_binary = False
 
+    elif dataset_name == "tinyimagenet":
+        client_loaders, global_test_loader, feature_dim, num_classes, _ = get_federated_tinyimagenet_features(
+            data_dir=args.data_dir,
+            num_clients=args.num_clients,
+            batch_size=args.batch_size,
+            device=str(device),
+            partition_type=args.partition_type,
+            alpha=getattr(args, "dirichlet_alpha", 0.5),
+            classes_per_client=getattr(args, "classes_per_client", 10),
+            seed=args.seed,
+            backbone=args.backbone,
+            num_classes_subset=getattr(args, "tinyimagenet_classes", 50),
+            subset_seed=getattr(args, "tinyimagenet_subset_seed", 0),
+        )
+        is_binary = False
+
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")
 
@@ -1948,6 +2131,13 @@ def run_dpfedgd_training(args):
                 'use_bias_correction': not args.sofim_disable_bias_correction
             }
 
+        warmup_use_ftrl = getattr(args, 'sofim_warmup_use_ftrl', False)
+        if warmup_use_ftrl and args.sofim_warmup_rounds > 0:
+            w = min(args.sofim_warmup_rounds, args.federated_rounds)
+            warmup_t_eff = math.ceil(math.log2(max(w, 2))) + 1
+            noise_reduction = (w / warmup_t_eff) ** 0.5
+            print(f"  Warmup FTRL: {w} warmup rounds → T_eff={warmup_t_eff} "
+                  f"(vs {w} sequential); noise reduction ≈ {noise_reduction:.2f}x over warmup phase")
         clients = [DPFedGDClient(i, loader, feature_dim, num_classes, device) for i, loader in
                    enumerate(client_loaders)]
         server = DPFedGDServerSOFIM(
@@ -1957,7 +2147,8 @@ def run_dpfedgd_training(args):
             use_bias_correction=sofim_params['use_bias_correction'],
             warmup_rounds=args.sofim_warmup_rounds,
             ablation_mode=getattr(args, 'sofim_ablation_mode', 'full'),
-            weight_decay=args.sofim_weight_decay
+            weight_decay=args.sofim_weight_decay,
+            warmup_use_ftrl=warmup_use_ftrl,
         )
 
     elif getattr(args, "use_fedavg_multi_iters", False):
@@ -1995,6 +2186,21 @@ def run_dpfedgd_training(args):
                    for i, loader in enumerate(client_loaders)]
         server = DPFedAvgServer(feature_dim, num_classes,
                                 learning_rate=args.learning_rate, device=device)
+
+    elif getattr(args, "use_adafedprox", False):
+        print(f"Mode: DP-AdaFedProx (K={args.fedprox_local_steps}, "
+              f"mu_0={args.fedprox_mu}, mu_t=mu_0/sqrt(t))")
+        clients = [DPFedGDClient(i, loader, feature_dim, num_classes, device)
+                   for i, loader in enumerate(client_loaders)]
+        server = DPFedAvgServer(feature_dim, num_classes,
+                                learning_rate=args.learning_rate, device=device)
+
+    elif getattr(args, "use_ftrl", False):
+        print("Mode: DP-FTRL (binary tree aggregation, Kairouz et al. ICML 2021)")
+        clients = [DPFedGDClient(i, loader, feature_dim, num_classes, device)
+                   for i, loader in enumerate(client_loaders)]
+        server = DPFedFTRLServer(feature_dim, num_classes,
+                                 learning_rate=args.learning_rate, device=device)
 
     # CASE: Standard DP-FedGD (First-Order)
     else:
@@ -2035,8 +2241,14 @@ def run_dpfedgd_training(args):
             total_dp_releases = args.federated_rounds * args.scaffold_local_steps
         elif getattr(args, "use_fedavg_multi_iters", False):
             total_dp_releases = args.federated_rounds * args.fedavg_local_steps
-        elif getattr(args, "use_fedprox", False):
+        elif getattr(args, "use_fedprox", False) or getattr(args, "use_adafedprox", False):
             total_dp_releases = args.federated_rounds * args.fedprox_local_steps
+        elif args.use_sofim and getattr(args, "sofim_warmup_use_ftrl", False) and args.sofim_warmup_rounds > 0:
+            # FTRL tree mechanism during warmup reduces warmup_rounds to T_eff compositions.
+            # Total effective compositions = T_eff(warmup) + (T - warmup) < T.
+            w = min(args.sofim_warmup_rounds, args.federated_rounds)
+            warmup_t_eff = math.ceil(math.log2(max(w, 2))) + 1
+            total_dp_releases = warmup_t_eff + (args.federated_rounds - w)
 
         if args.use_fedfc:
             # If DP is enabled, Algorithm 3 requires covariance noise sigma_c.
@@ -2062,7 +2274,12 @@ def run_dpfedgd_training(args):
                     args.fc_sigma_c = 0.0
                 sanitizer = None
         else:
-            sanitizer_cls = DPFedScaffoldSanitizer if getattr(args, "use_scaffold", False) else DPFedGDSanitizer
+            if getattr(args, "use_ftrl", False):
+                sanitizer_cls = DPFedFTRLSanitizer
+            elif getattr(args, "use_scaffold", False):
+                sanitizer_cls = DPFedScaffoldSanitizer
+            else:
+                sanitizer_cls = DPFedGDSanitizer
             sanitizer = sanitizer_cls(
                 num_clients=args.num_clients,
                 clients_per_round=args.clients_per_round,
@@ -2070,6 +2287,7 @@ def run_dpfedgd_training(args):
                 gradient_clip_norm=args.gradient_clip_norm,
                 dataset_size=min_dataset_size,
                 neighbor_type="replace_one",
+                display_rounds=args.federated_rounds,
                 device=device
             )
 
@@ -2207,6 +2425,19 @@ def run_dpfedgd_training(args):
                     client_lr=args.fedprox_client_lr,
                     mu=args.fedprox_mu,
                 )
+
+            elif getattr(args, "use_adafedprox", False):
+                # Diminishing proximal: mu_t = mu_0 / sqrt(t), floored at 10% of mu_0
+                mu_t = max(args.fedprox_mu / math.sqrt(round_num),
+                           args.fedprox_mu * 0.1)
+                delta_x, client_stats = client.compute_fedprox_update(
+                    global_weights=global_weights,
+                    sanitizer=sanitizer,
+                    K=args.fedprox_local_steps,
+                    client_lr=args.fedprox_client_lr,
+                    mu=mu_t,
+                )
+                client_stats['adaptive_mu'] = mu_t
                 deltas_x.append(delta_x)
                 round_stats['total_loss'] += client_stats['loss'] * len(client.train_loader.dataset)
                 round_stats['total_samples'] += len(client.train_loader.dataset)
@@ -2239,8 +2470,10 @@ def run_dpfedgd_training(args):
             server_stats = server.aggregate_and_update(client_updates, sanitizer)
         elif getattr(args, "use_fedyogi", False):
             server_stats = server.aggregate_and_update(client_updates, sanitizer)
-        elif getattr(args, "use_fedprox", False):
+        elif getattr(args, "use_fedprox", False) or getattr(args, "use_adafedprox", False):
             server_stats = server.aggregate_and_update(deltas_x)
+        elif getattr(args, "use_ftrl", False):
+            server_stats = server.aggregate_and_update(client_updates, sanitizer)
         else:
             # Standard First-Order Update
             server_stats = server.aggregate_and_update(client_updates, sanitizer)
@@ -2263,33 +2496,46 @@ def run_dpfedgd_training(args):
         round_result.update(_agg_client_stats(client_debug_stats))
 
         # --- Fisher Alignment Diagnostic (SOFIM full mode only, every 10 rounds) ---
-        if (args.use_sofim
-                and getattr(args, 'sofim_ablation_mode', 'full') == 'full'
-                and server.M is not None
-                and round_num % 10 == 0):
-            align_stats = compute_fisher_alignment(
-                clients=selected_clients,
-                global_weights=server.get_global_weights(),
-                momentum_buffer=server.M,
-                device=device,
-                max_clients=min(5, len(selected_clients)),
-            )
-            torch.cuda.empty_cache()
-            round_result.update(align_stats)
+        # if (args.use_sofim
+        #         and getattr(args, 'sofim_ablation_mode', 'full') == 'full'
+        #         and server.M is not None
+        #         and round_num % 10 == 0):
+        #     align_stats = compute_fisher_alignment(
+        #         clients=selected_clients,
+        #         global_weights=server.get_global_weights(),
+        #         momentum_buffer=server.M,
+        #         device=device,
+        #         max_clients=min(5, len(selected_clients)),
+        #     )
+        #     torch.cuda.empty_cache()
+        #     round_result.update(align_stats)
 
         # --- Periodic Evaluation ---
         if round_num % args.eval_every == 0 or round_num == args.federated_rounds:
             eval_metrics = server.evaluate(global_test_loader, is_binary)
             round_result.update(eval_metrics)
+
+            if args.use_sofim:
+                optimizer_log = (
+                    f"||g_agg||={round_result.get('gradient_norm', 0.0):.3e}, "
+                    f"||M||={round_result.get('moment_norm', 0.0):.3e}, "
+                    f"||Mhat||={round_result.get('moment_corrected_norm', 0.0):.3e}, "
+                    f"update={round_result.get('update_norm', 0.0):.3e}, "
+                )
+            else:
+                optimizer_log = (
+                    f"||u_avg||={round_result.get('u_avg_norm', 0.0):.3e}, "
+                    f"||U_k||={round_result.get('U_k_norm', 0.0):.3e}, "
+                    f"ratio={round_result.get('precond_ratio', 0.0):.3e}, "
+                )
+
             print(
                 f"Round {round_num:3d}/{args.federated_rounds}: "
                 f"Loss={round_result['train_loss']:.4f}, "
                 f"Acc={eval_metrics['accuracy']:.4f}, "
                 f"clip%={round_result.get('clip_frac_mean', 0.0):.2f}, "
                 f"||g||={round_result.get('grad_norm_before_noise_mean', 0.0):.3f}, "
-                f"||u_avg||={round_result.get('u_avg_norm', 0.0):.3e}, "
-                f"||U_k||={round_result.get('U_k_norm', 0.0):.3e}, "
-                f"ratio={round_result.get('precond_ratio', 0.0):.3e}, "
+                f"{optimizer_log}"
                 f"σ_server={round_result.get('sum_noise_std_mean', 0.0):.3e}, "
                 f"Time={round_time:.1f}s"
             )
@@ -2297,7 +2543,7 @@ def run_dpfedgd_training(args):
         results['round_results'].append(round_result)
 
     # --- Final Stats ---
-    final_metrics = server.evaluate(global_test_loader, is_binary)
+    final_metrics = server.evaluate(global_test_loader, is_binary, return_mask=True)
     total_time = time.time() - start_time
 
     dp_enabled_final = sanitizer is not None
@@ -2337,6 +2583,12 @@ def run_dpfedgd_training(args):
         print(f"Final Accuracy: {final_metrics['accuracy']:.4f} | Privacy: DISABLED")
     print("=" * 70)
 
+    import gc
+    del clients, server
+    if sanitizer is not None:
+        del sanitizer
+    torch.cuda.empty_cache()
+    gc.collect()
     return results
 
 def main():

@@ -258,6 +258,44 @@ def get_cifar100_resnet20_features(device='cuda'):
         print(f"❌ Error: {e}")
         raise
 
+
+def get_cifar100_vgg16_bn_features(device='cuda'):
+    """
+    VGG-16 with BatchNorm pretrained on CIFAR-100 (chenyaofo/pytorch-cifar-models).
+
+    Architecture contrast with ResNet-20:
+      - No skip connections — pure sequential conv-BN-ReLU stacks
+      - 5 MaxPool stages on 32×32 input → 1×1 spatial output
+      - Feature dimension: 512
+
+    Feature dim: 512
+    """
+    print("=" * 80)
+    print("Loading CIFAR-100 Pretrained VGG-16-BN")
+    print("=" * 80)
+    try:
+        model = torch.hub.load(
+            "chenyaofo/pytorch-cifar-models",
+            "cifar100_vgg16_bn",
+            pretrained=True,
+            trust_repo=True
+        )
+        # VGG children: [features (Sequential of conv/BN/ReLU/MaxPool), classifier (Linear)]
+        # For 32×32 CIFAR input, 5 MaxPool stages reduce spatial dims to 1×1,
+        # so features output is [B, 512, 1, 1] → Flatten → [B, 512]
+        feature_extractor = nn.Sequential(*list(model.children())[:-1])
+        feature_extractor.add_module('flatten', nn.Flatten())
+        feature_extractor.eval()
+        for param in feature_extractor.parameters():
+            param.requires_grad = False
+        print("✅ Loaded CIFAR-100 pretrained VGG-16-BN")
+        print("   Feature dimension: 512")
+        print("=" * 80)
+        return feature_extractor.to(device)
+    except Exception as e:
+        print(f"❌ Error loading CIFAR-100 VGG-16-BN: {e}")
+        raise
+
 def get_vit_features(device='cuda', model_name='vit_base_patch16_224'):
     """
     ViT pretrained on ImageNet via timm.
@@ -286,7 +324,10 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader, Subset
 from torchvision import datasets, transforms
+from PIL import Image
 import numpy as np
+import urllib.request
+import zipfile
 from typing import List, Tuple, Dict, Optional
 
 
@@ -576,40 +617,45 @@ def get_federated_cifar10_feature_loaders(
 
     print(f"Loaded CIFAR-10: {len(trainset)} train, {len(testset)} test samples")
 
-    # Load feature extractor
     device_obj = torch.device(device)
 
-    if backbone == "resnet20":
-        feature_extractor = get_cifar10_resnet20_features(device)
-    elif backbone == "resnet32":
-        feature_extractor = get_cifar10_resnet32_features(device)
-    elif backbone == "resnet44":
-        feature_extractor = get_cifar10_resnet44_features(device)
-    elif backbone == "resnet56":
-        feature_extractor = get_cifar10_resnet56_features(device)
-    elif backbone == "cifar100_resnet56":
-        feature_extractor = get_cifar100_resnet56_features(device)
-    elif backbone == "cifar100_resnet20":
-        feature_extractor = get_cifar100_resnet20_features(device)
-    elif backbone == "vit_base":
-        return get_vit_features(device, 'vit_base_patch16_224'), 768
-    elif backbone == "vit_small":
-        return get_vit_features(device, 'vit_small_patch16_224'), 384
-    else:
+    if backbone not in ("resnet20", "resnet32", "resnet44", "resnet56",
+                        "cifar100_resnet20", "cifar100_resnet56", "cifar100_vgg16_bn"):
         raise ValueError(
             f"Unknown backbone: {backbone}. "
-            f"Supported: resnet20/32/44/56, cifar100_resnet20/56, vit_base, vit_small")
+            f"Supported: resnet20/32/44/56, cifar100_resnet20/56, cifar100_vgg16_bn"
+        )
 
-        # Extract features
-    print(f"\nExtracting features from training set...")
-    train_features, train_labels = extract_features_from_dataset(
-        trainset, feature_extractor, device_obj, batch_size=128
-    )
+    cache_fname = f"features_cifar10_{backbone}.pt"
+    cache_path = os.path.join(data_dir, cache_fname)
 
-    print(f"Extracting features from test set...")
-    test_features, test_labels = extract_features_from_dataset(
-        testset, feature_extractor, device_obj, batch_size=128
-    )
+    if os.path.exists(cache_path):
+        print(f"\nLoading cached CIFAR-10 features: {cache_fname}")
+        cached = torch.load(cache_path, map_location='cpu')
+        train_features = cached['train_features']
+        train_labels   = cached['train_labels']
+        test_features  = cached['test_features']
+        test_labels    = cached['test_labels']
+    else:
+        feature_extractor = _select_cifar_style_feature_extractor(backbone, device)
+
+        print(f"\nExtracting features from training set...")
+        train_features, train_labels = extract_features_from_dataset(
+            trainset, feature_extractor, device_obj, batch_size=128
+        )
+        print(f"Extracting features from test set...")
+        test_features, test_labels = extract_features_from_dataset(
+            testset, feature_extractor, device_obj, batch_size=128
+        )
+
+        del feature_extractor
+        torch.cuda.empty_cache()
+
+        torch.save({
+            'train_features': train_features, 'train_labels': train_labels,
+            'test_features':  test_features,  'test_labels':  test_labels,
+        }, cache_path)
+        print(f"CIFAR-10 features cached to {cache_fname}")
 
     feature_dim = train_features.shape[1]
     print(f"✅ Feature extraction complete! Dimension: {feature_dim}")
@@ -831,23 +877,41 @@ def get_federated_chestmnist_features(
     print(f"Loaded ChestMNIST: {len(train_dataset)} train, {len(test_dataset)} test samples")
 
     # -----------------------------------------------------------------------
-    # 2. Build feature extractor
+    # 2. Build feature extractor (with disk cache)
     # -----------------------------------------------------------------------
     device_obj = torch.device(device)
-    feature_extractor, feature_dim_backbone = _select_cifar_style_feature_extractor(backbone, device)
 
-    # -----------------------------------------------------------------------
-    # 3. Extract features from train and test sets
-    # -----------------------------------------------------------------------
-    print("\nExtracting features from ChestMNIST training set...")
-    train_features, train_labels = extract_features_from_dataset(
-        train_dataset, feature_extractor, device_obj, batch_size=128
-    )
+    os.makedirs("./data", exist_ok=True)
+    cache_fname = f"features_chestmnist_{backbone}.pt"
+    cache_path = os.path.join("./data", cache_fname)
 
-    print("Extracting features from ChestMNIST test set...")
-    test_features, test_labels = extract_features_from_dataset(
-        test_dataset, feature_extractor, device_obj, batch_size=128
-    )
+    if os.path.exists(cache_path):
+        print(f"\nLoading cached ChestMNIST features: {cache_fname}")
+        cached = torch.load(cache_path, map_location='cpu')
+        train_features = cached['train_features']
+        train_labels   = cached['train_labels']
+        test_features  = cached['test_features']
+        test_labels    = cached['test_labels']
+    else:
+        feature_extractor = _select_cifar_style_feature_extractor(backbone, device)
+
+        print("\nExtracting features from ChestMNIST training set...")
+        train_features, train_labels = extract_features_from_dataset(
+            train_dataset, feature_extractor, device_obj, batch_size=128
+        )
+        print("Extracting features from ChestMNIST test set...")
+        test_features, test_labels = extract_features_from_dataset(
+            test_dataset, feature_extractor, device_obj, batch_size=128
+        )
+
+        del feature_extractor
+        torch.cuda.empty_cache()
+
+        torch.save({
+            'train_features': train_features, 'train_labels': train_labels,
+            'test_features':  test_features,  'test_labels':  test_labels,
+        }, cache_path)
+        print(f"ChestMNIST features cached to {cache_fname}")
 
     # -----------------------------------------------------------------------
     # 4. Convert labels to CIFAR-style single-label multi-class IDs
@@ -975,8 +1039,13 @@ def _select_cifar_style_feature_extractor(backbone: str, device: str):
         return get_cifar100_resnet56_features(device)
     elif backbone == "cifar100_resnet20":
         return get_cifar100_resnet20_features(device)
+    elif backbone == "cifar100_vgg16_bn":
+        return get_cifar100_vgg16_bn_features(device)
     else:
-        raise ValueError(f"Unknown backbone: {backbone}. Supported: resnet20/32/44/56, cifar100_resnet20/56")
+        raise ValueError(
+            f"Unknown backbone: {backbone}. "
+            f"Supported: resnet20/32/44/56, cifar100_resnet20/56, cifar100_vgg16_bn"
+        )
 
 
 def get_federated_medmnist_rgb_features(
@@ -1065,18 +1134,40 @@ def get_federated_medmnist_rgb_features(
 
     print(f"Loaded {data_flag}: {len(train_dataset)} train, {len(test_dataset)} test samples")
 
-    # Build feature extractor
     device_obj = torch.device(device)
-    feature_extractor = _select_cifar_style_feature_extractor(backbone, device)
-
-    # Extract features
     extract_bs = 32 if backbone.startswith('vit') else feature_extract_batch_size
-    train_features, train_labels = extract_features_from_dataset(
-        train_dataset, feature_extractor, device_obj, batch_size=extract_bs
-    )
-    test_features, test_labels = extract_features_from_dataset(
-        test_dataset, feature_extractor, device_obj, batch_size=extract_bs
-    )
+
+    os.makedirs("./data", exist_ok=True)
+    cache_fname = f"features_{data_flag}_{backbone}_r{input_size}.pt"
+    cache_path = os.path.join("./data", cache_fname)
+
+    if os.path.exists(cache_path):
+        print(f"\nLoading cached {data_flag} features: {cache_fname}")
+        cached = torch.load(cache_path, map_location='cpu')
+        train_features = cached['train_features']
+        train_labels   = cached['train_labels']
+        test_features  = cached['test_features']
+        test_labels    = cached['test_labels']
+    else:
+        feature_extractor = _select_cifar_style_feature_extractor(backbone, device)
+
+        print(f"\nExtracting features from {data_flag} training set...")
+        train_features, train_labels = extract_features_from_dataset(
+            train_dataset, feature_extractor, device_obj, batch_size=extract_bs
+        )
+        print(f"Extracting features from {data_flag} test set...")
+        test_features, test_labels = extract_features_from_dataset(
+            test_dataset, feature_extractor, device_obj, batch_size=extract_bs
+        )
+
+        del feature_extractor
+        torch.cuda.empty_cache()
+
+        torch.save({
+            'train_features': train_features, 'train_labels': train_labels,
+            'test_features':  test_features,  'test_labels':  test_labels,
+        }, cache_path)
+        print(f"{data_flag} features cached to {cache_fname}")
 
     # MedMNIST labels are typically shape [N, 1] (or sometimes [N])
     if train_labels.ndim == 2 and train_labels.size(1) == 1:
@@ -1168,3 +1259,299 @@ def get_federated_bloodmnist_features(**kwargs):
 
 def get_federated_dermamnist_features(**kwargs):
     return get_federated_medmnist_rgb_features(data_flag='dermamnist', **kwargs)
+
+
+# ============================================================================
+# TINY-IMAGENET (200 classes, 64×64 RGB)
+# ============================================================================
+
+class _TinyImageNetValDataset(Dataset):
+    """Wraps the flat Tiny-ImageNet val split into an ImageFolder-compatible dataset.
+
+    The standard val layout is::
+
+        tiny-imagenet-200/val/
+            images/val_1.JPEG ...
+            val_annotations.txt   (tab-separated: filename  wnid  x1 y1 x2 y2)
+
+    Labels are mapped with the same class_to_idx as the training ImageFolder so
+    indices are consistent across splits.
+    """
+
+    def __init__(self, val_root: str, class_to_idx: dict, transform=None):
+        self.transform = transform
+        img_dir = os.path.join(val_root, 'images')
+        ann_file = os.path.join(val_root, 'val_annotations.txt')
+
+        self.samples = []
+        with open(ann_file, 'r') as f:
+            for line in f:
+                parts = line.strip().split('\t')
+                fname, cls = parts[0], parts[1]
+                if cls in class_to_idx:
+                    self.samples.append(
+                        (os.path.join(img_dir, fname), class_to_idx[cls])
+                    )
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        path, label = self.samples[idx]
+        img = Image.open(path).convert('RGB')
+        if self.transform is not None:
+            img = self.transform(img)
+        return img, label
+
+
+def _download_tinyimagenet(data_dir: str) -> None:
+    """Download and extract Tiny-ImageNet-200 (~237 MB) into data_dir."""
+    import subprocess
+    url = "http://cs231n.stanford.edu/tiny-imagenet-200.zip"
+    os.makedirs(data_dir, exist_ok=True)
+    zip_path = os.path.join(data_dir, 'tiny-imagenet-200.zip')
+    print(f"Downloading Tiny-ImageNet-200 (~237 MB) → {zip_path}")
+
+    # wget is faster and shows real progress on Colab; fall back to urllib
+    wget_ok = subprocess.run(['which', 'wget'], capture_output=True).returncode == 0
+    if wget_ok:
+        subprocess.run(['wget', '-q', '--show-progress', url, '-O', zip_path], check=True)
+    else:
+        urllib.request.urlretrieve(url, zip_path)
+
+    print("Extracting...")
+    # unzip (C binary) is ~10x faster than Python zipfile for many small files
+    unzip_ok = subprocess.run(['which', 'unzip'], capture_output=True).returncode == 0
+    if unzip_ok:
+        subprocess.run(['unzip', '-q', zip_path, '-d', data_dir], check=True)
+    else:
+        with zipfile.ZipFile(zip_path, 'r') as zf:
+            zf.extractall(data_dir)
+    os.remove(zip_path)
+    print("✅ Tiny-ImageNet-200 ready.")
+
+
+def get_federated_tinyimagenet_features(
+        data_dir: str = "./data",
+        num_clients: int = 20,
+        batch_size: int = 64,
+        device: str = "cuda",
+        partition_type: str = "iid",
+        alpha: float = 0.5,
+        classes_per_client: int = 10,
+        min_samples_per_client: int = 10,
+        seed: int = 42,
+        backbone: str = "cifar100_resnet20",
+        resize_to: int = 32,
+        download: bool = True,
+        num_classes_subset: int = 50,
+        subset_seed: int = 0,
+) -> Tuple[List[DataLoader], DataLoader, int, int, Dict]:
+    """Create federated feature loaders for Tiny-ImageNet (200 classes, 64×64 RGB).
+
+    Images are resized to ``resize_to``×``resize_to`` (default 32) and
+    normalised with CIFAR statistics so they are compatible with the
+    CIFAR-pretrained backbone feature extractors.
+
+    **Google Colab**: if ``/content/drive/MyDrive/tinyimagenet_cache`` exists
+    (Drive is mounted), the dataset is read from / saved to that directory so it
+    persists across sessions without re-downloading.  Just create the folder on
+    Drive once — ``mkdir -p /content/drive/MyDrive/tinyimagenet_cache`` — and
+    the first run will auto-download there.
+
+    Expected layout (auto-created when ``download=True``)::
+
+        <data_dir>/tiny-imagenet-200/
+            train/<wnid>/images/*.JPEG
+            val/images/*.JPEG
+            val/val_annotations.txt
+
+    Args:
+        data_dir: Root data directory.  On Colab the Drive cache takes priority
+            automatically — you can leave this at its default.
+        num_clients: Number of federated clients.
+        batch_size: DataLoader batch size for training.
+        device: Device for feature extraction ('cuda' or 'cpu').
+        partition_type: One of 'iid', 'non_iid_classes', 'dirichlet'.
+        alpha: Dirichlet concentration (lower → more heterogeneous).
+        classes_per_client: Classes per client for non_iid_classes partition.
+            With 200 classes and 20 clients, use ≥10 to cover all classes.
+        min_samples_per_client: Minimum samples per client (dirichlet only).
+        seed: Random seed.
+        backbone: CIFAR-pretrained backbone name (e.g. 'cifar100_resnet20').
+        resize_to: Target spatial resolution for the backbone (default 32).
+        download: Auto-download the dataset if not found (default True).
+
+    Returns:
+        (client_loaders, test_loader, feature_dim, num_classes=200, partition_stats)
+    """
+    # On Colab: prefer Drive cache so the dataset survives session resets.
+    _drive_cache = '/content/drive/MyDrive/tinyimagenet_cache'
+    if os.path.isdir(_drive_cache):
+        data_dir = _drive_cache
+        print(f"[Tiny-ImageNet] Using Google Drive cache: {_drive_cache}")
+
+    tiny_root = os.path.join(data_dir, 'tiny-imagenet-200')
+    if not os.path.isdir(tiny_root):
+        if not download:
+            raise FileNotFoundError(
+                f"Tiny-ImageNet not found at {tiny_root}. "
+                "Pass download=True or place the dataset there manually."
+            )
+        _download_tinyimagenet(data_dir)
+
+    print("\n" + "=" * 80)
+    print("Creating Federated Tiny-ImageNet Dataset")
+    print("=" * 80)
+    print(f"Clients:   {num_clients}")
+    print(f"Partition: {partition_type}")
+    print(f"Backbone:  {backbone}")
+    print(f"Resize:    {resize_to}x{resize_to}")
+    print("=" * 80)
+
+    transform = transforms.Compose([
+        transforms.Resize((resize_to, resize_to)),
+        transforms.ToTensor(),
+        transforms.Normalize((0.4914, 0.4822, 0.4465),
+                             (0.2023, 0.1994, 0.2010)),
+    ])
+
+    train_dataset = datasets.ImageFolder(
+        os.path.join(tiny_root, 'train'), transform=transform
+    )
+    val_dataset = _TinyImageNetValDataset(
+        val_root=os.path.join(tiny_root, 'val'),
+        class_to_idx=train_dataset.class_to_idx,
+        transform=transform,
+    )
+
+    num_classes = 200
+    print(f"Loaded Tiny-ImageNet: {len(train_dataset)} train, {len(val_dataset)} val samples")
+
+    device_obj = torch.device(device)
+
+    # -----------------------------------------------------------------------
+    # Feature cache — keyed by backbone + resize so different configs don't
+    # collide.  Stored inside tiny_root (i.e. on Drive when using Drive cache)
+    # so features survive Colab session resets automatically.
+    # -----------------------------------------------------------------------
+    cache_fname = f"features_{backbone}_r{resize_to}.pt"
+    cache_path = os.path.join(tiny_root, cache_fname)
+
+    if os.path.exists(cache_path):
+        print(f"[Tiny-ImageNet] Loading cached features: {cache_fname}")
+        cached = torch.load(cache_path, map_location='cpu')
+        train_features = cached['train_features']
+        train_labels   = cached['train_labels']
+        val_features   = cached['val_features']
+        val_labels     = cached['val_labels']
+    else:
+        feature_extractor = _select_cifar_style_feature_extractor(backbone, device)
+
+        print("\nExtracting features from Tiny-ImageNet training set...")
+        train_features, train_labels = extract_features_from_dataset(
+            train_dataset, feature_extractor, device_obj, batch_size=128
+        )
+        print("Extracting features from Tiny-ImageNet val set...")
+        val_features, val_labels = extract_features_from_dataset(
+            val_dataset, feature_extractor, device_obj, batch_size=128
+        )
+
+        # Free the backbone immediately — it can be 140 MB+ on GPU and is
+        # no longer needed once features are extracted.
+        del feature_extractor
+        torch.cuda.empty_cache()
+
+        torch.save({
+            'train_features': train_features,
+            'train_labels':   train_labels,
+            'val_features':   val_features,
+            'val_labels':     val_labels,
+        }, cache_path)
+        print(f"[Tiny-ImageNet] Features cached to {cache_fname}")
+
+    train_labels = train_labels.long()
+    val_labels   = val_labels.long()
+
+    # -----------------------------------------------------------------------
+    # Class subsetting — select num_classes_subset random classes from 200.
+    # subset_seed is fixed so the selection is reproducible and reportable.
+    # -----------------------------------------------------------------------
+    if num_classes_subset < 200:
+        rng = np.random.RandomState(subset_seed)
+        selected = np.sort(rng.choice(200, size=num_classes_subset, replace=False))
+        print(f"[Tiny-ImageNet] Using {num_classes_subset}-class subset "
+              f"(seed={subset_seed}, classes={selected[:5].tolist()}...)")
+
+        train_mask = np.isin(train_labels.numpy(), selected)
+        val_mask   = np.isin(val_labels.numpy(),   selected)
+        train_features = train_features[train_mask]
+        val_features   = val_features[val_mask]
+
+        # Remap original class indices → 0 .. num_classes_subset-1
+        remap = {int(old): new for new, old in enumerate(selected)}
+        train_labels = torch.tensor([remap[l.item()] for l in train_labels[train_mask]],
+                                    dtype=torch.long)
+        val_labels   = torch.tensor([remap[l.item()] for l in val_labels[val_mask]],
+                                    dtype=torch.long)
+
+    num_classes = num_classes_subset
+
+    feature_dim = train_features.shape[1]
+    print(f"✅ Feature extraction complete! Dimension: {feature_dim}, "
+          f"Classes: {num_classes}, "
+          f"Train: {len(train_labels)}, Val: {len(val_labels)}")
+
+    print(f"\nPartitioning Tiny-ImageNet data across {num_clients} clients...")
+    temp_dataset = [(None, int(label.item())) for label in train_labels]
+
+    if partition_type == "iid":
+        client_indices = partition_data_iid(temp_dataset, num_clients, seed)
+    elif partition_type == "non_iid_classes":
+        client_indices = partition_data_non_iid_classes(
+            temp_dataset, num_clients, classes_per_client, seed
+        )
+    elif partition_type == "dirichlet":
+        client_indices = partition_data_dirichlet(
+            temp_dataset, num_clients, alpha, seed, min_samples_per_client
+        )
+    else:
+        raise ValueError(f"Unknown partition type: {partition_type}")
+
+    client_loaders: List[DataLoader] = []
+    partition_stats: Dict = {
+        'num_clients': num_clients,
+        'partition_type': partition_type,
+        'client_sizes': [],
+        'client_class_distributions': [],
+    }
+
+    for client_id, indices in enumerate(client_indices):
+        client_features = train_features[indices]
+        client_labels = train_labels[indices]
+
+        client_dataset = FeatureDataset(client_features, client_labels)
+        client_loader = DataLoader(
+            client_dataset, batch_size=batch_size, shuffle=True,
+            num_workers=0, pin_memory=False
+        )
+        client_loaders.append(client_loader)
+
+        partition_stats['client_sizes'].append(len(indices))
+        unique, counts = torch.unique(client_labels, return_counts=True)
+        class_dist = {int(k): int(v) for k, v in zip(unique, counts)}
+        partition_stats['client_class_distributions'].append(class_dist)
+
+        print(f"  Client {client_id}: {len(indices)} samples, "
+              f"{len(class_dist)} distinct classes")
+
+    test_dataset_features = FeatureDataset(val_features, val_labels)
+    test_loader = DataLoader(
+        test_dataset_features, batch_size=batch_size, shuffle=False,
+        num_workers=0, pin_memory=False
+    )
+
+    print("✅ Federated Tiny-ImageNet dataset created successfully!")
+    print("=" * 80 + "\n")
+
+    return client_loaders, test_loader, feature_dim, num_classes, partition_stats

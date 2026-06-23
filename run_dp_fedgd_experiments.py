@@ -12,13 +12,15 @@ from train import run_dpfedgd_training, parse_args
 # =============================================================================
 
 # --- Backbone ---
-SWEEP_BACKBONE = "cifar100_resnet20"
+SWEEP_BACKBONE = "cifar100_vgg16_bn"
 
 # --- Experiment Dimensions ---
-DATASETS         = ["pathmnist"]
+# Available datasets: "cifar10", "cifar10_binary", "pathmnist", "bloodmnist",
+#                     "dermamnist", "chestmnist", "tinyimagenet"
+DATASETS         = ["cifar10"]
 NUM_CLIENTS_LIST = [20]
-epsilons         = [0.5,1,5,10]
-SEEDS            = [42]#123, 7
+epsilons         = [0.5,1]
+SEEDS            = [42]#9,2024]
 PARTITION_TYPES  = ["dirichlet"]
 DIRICHLET_ALPHA  = 0.5
 rounds_list      = [70]
@@ -29,13 +31,15 @@ FORCE_RERUN = True
 # --- Algorithm Selection — set True for each you want to run ---
 USE_FEDNEW_FC    = False
 USE_FEDFC        = False
-USE_SOFIM        = False
-USE_SCAFFOLD     = True
+USE_SOFIM        = True
+USE_SCAFFOLD     = False
 USE_FEDAVG_MULTI = False
 USE_FEDADAM      = False
 USE_FEDYOGI      = False
 USE_FEDPROX      = False
+USE_ADAFEDPROX   = False
 USE_FEDGD        = False
+USE_FTRL         = False
 NO_DP_BASELINE   = False
 
 # =============================================================================
@@ -44,7 +48,6 @@ NO_DP_BASELINE   = False
 # All params from coarse→fine hyperparam search
 # =============================================================================
 
-# --- FedNew-FC defaults (not tuned) ---
 FN_ALPHA    = 0.1
 FN_RHO      = 0.1
 FN_C1       = 1.0
@@ -52,17 +55,29 @@ FN_C2       = 1.0
 FN_C_PRIMAL = 1.0
 
 # --- FedGD ---
-FEDGD_LR_PER_EPS = {0.5: 0.1, 1: 0.1, 5: 0.1, 10: 0.1}
+FEDGD_LR_PER_EPS = {0.5: 0.08, 1: 0.1, 5: 0.1, 10: 0.1}
+
+# --- DP-FTRL (Kairouz et al. ICML 2021) ---
+# FTRL uses running average of gradients → effective LR is higher than FedGD.
+# Starting point: same as FedGD; tune upward if needed.
+FTRL_LR_PER_EPS = {0.5: 2.5, 1: 3.0, 5: 7.0, 10: 8}
+
+# --- AdaFedProx ---
+# mu_t = mu_0 / sqrt(t); mu_0 and local_steps are the dominant hyperparams.
+ADAFEDPROX_LR_PER_EPS          = {0.5: 0.8,  1: 1.0,  5: 1.0,  10: 1.0}
+ADAFEDPROX_CLIENT_LR_PER_EPS   = {0.5: 0.1,  1: 0.1,  5: 0.1,  10: 0.1}
+ADAFEDPROX_MU0_PER_EPS         = {0.5: 0.1,  1: 0.05, 5: 0.01, 10: 0.01}
+ADAFEDPROX_LOCAL_STEPS_PER_EPS = {0.5: 1,    1: 5,    5: 5,    10: 5}
 
 # ---FedAvg
 # Add these after FEDGD_LR_PER_EPS:
-FEDAVG_LR_PER_EPS          = {0.5: 1.0, 0.75: 1.0, 1: 1.0, 2: 1.0, 5: 1.0, 10: 1.0}
+FEDAVG_LR_PER_EPS          = {0.5: 0.8, 0.75: 1.0, 1: 1.0, 2: 1.0, 5: 1.0, 10: 1.0}
 FEDAVG_CLIENT_LR_PER_EPS   = {0.5: 0.1, 0.75: 0.1, 1: 0.1, 2: 0.1, 5: 0.1, 10: 0.1}
 FEDAVG_LOCAL_STEPS_PER_EPS = {0.5: 1,   0.75: 1,   1: 1,   2: 1,   5: 1,   10: 1}
 
 # --- FedFC ---
-FEDFC_LR_PER_EPS    = {0.5: 0.4, 1: 0.3, 5: 2.0, 10: 0.5}
-FEDFC_GAMMA_PER_EPS = {0.5: 2.0, 1: 1.0, 5: 5.0, 10: 5.0}
+FEDFC_LR_PER_EPS    = {0.5: 0.3, 1: 0.15, 5: 2.0, 10: 0.5}
+FEDFC_GAMMA_PER_EPS = {0.5: 2.0, 1: 5.0, 5: 5.0, 10: 5.0}
 FEDFC_CC      = 1.0
 FEDFC_SIGMA_C = 1.0
 
@@ -72,7 +87,7 @@ SCAFFOLD_CLIENT_LR_PER_EPS   = {0.5: 0.2, 1: 0.1, 5: 0.1, 10: 0.05}
 SCAFFOLD_LOCAL_STEPS_PER_EPS = {0.5: 1,   1: 5,   5: 7,   10: 7}
 
 # --- FedAdam ---
-FEDADAM_LR_PER_EPS      = {0.5: 0.02, 1: 0.05, 5: 0.1,    10: 0.05}
+FEDADAM_LR_PER_EPS      = {0.5: 0.01, 1: 0.01, 5: 0.1,    10: 0.05}
 FEDADAM_BETA1_PER_EPS   = {0.5: 0.8, 1: 0.9,  5: 0.9,    10: 0.95}
 FEDADAM_BETA2_PER_EPS   = {0.5: 0.8, 1: 0.999,5: 0.9999, 10: 0.9999}
 FEDADAM_EPSILON_PER_EPS = {0.5: 0.1,  1: 0.05, 5: 0.01,   10: 1e-5}
@@ -85,18 +100,18 @@ FEDYOGI_EPSILON_PER_EPS = {0.5: 0.1,  1: 0.05, 5: 0.01,  10: 1e-5}
 
 # --- SOFIM ---
 SOFIM_LR_PER_EPS = {
-    0.5: 0.2,
+    0.5: 0.5,
     0.75: 0.5,
-    1: 3.0,
+    1: 4.0,
     2: 0.8,
     5: 0.8,
     10: 0.8,
 }
 
 SOFIM_RHO_PER_EPS = {
-    0.5: 0.5,
+    0.5: 1.5,
     0.75: 0.5,
-    1: 10,
+    1: 20.0,
     2: 0.5,
     5: 0.5,
     10: 0.5,
@@ -112,16 +127,16 @@ SOFIM_BETA_PER_EPS = {
 }
 
 BIAS_CORR = {
-    0.5: True,
+    0.5: False,
     0.75: True,
-    1: True,
+    1: False,
     2: True,
     5: False,
     10: False,
 }
 
 SOFIM_WARMUP_PER_EPS = {
-    0.5: 10,
+    0.5: 5,
     0.75: 10,
     1: 0,
     2: 0,
@@ -129,6 +144,8 @@ SOFIM_WARMUP_PER_EPS = {
     10: 0,
 }
 SOFIM_WEIGHT_DECAY = 5e-4
+SOFIM_WARMUP_USE_FTRL = False   # set True to use DP-FTRL update rule during warmup rounds
+SOFIM_FTRL_WARMUP_ROUNDS = 20   # warmup rounds used when SOFIM_WARMUP_USE_FTRL=True
 
 # --- ρ Sweep (SOFIM only) ---
 RHO_SWEEP     = False
@@ -148,7 +165,7 @@ ABLATION_PARTITION = "dirichlet"
 ABLATION_ROUNDS    = 70
 
 # --- Output directory ---
-results_dir = "./results_sweep_postreview_pathmnist_final_runtime"
+results_dir = "./results_sweep_postreview_cifar10_vgg"
 os.makedirs(results_dir, exist_ok=True)
 
 # =============================================================================
@@ -163,6 +180,8 @@ if USE_SCAFFOLD:     ACTIVE_ALGOS.append("scaffold")
 if USE_FEDADAM:      ACTIVE_ALGOS.append("fedadam")
 if USE_FEDYOGI:      ACTIVE_ALGOS.append("fedyogi")
 if USE_SOFIM:        ACTIVE_ALGOS.append("sofim")
+if USE_FTRL:         ACTIVE_ALGOS.append("ftrl")
+if USE_ADAFEDPROX:   ACTIVE_ALGOS.append("adafedprox")
 
 print(f"Starting multi-algorithm sweep")
 print(f"  Algorithms:  {ACTIVE_ALGOS}")
@@ -201,11 +220,24 @@ def make_args(algo, eps, rounds, seed, dataset, num_clients, partition_type,
     args.use_fedyogi            = False
     args.use_fedprox            = False
     args.use_sofim              = False
+    args.use_ftrl               = False
+    args.use_adafedprox         = False
     args.no_dp                  = NO_DP_BASELINE
 
     # --- Algorithm-specific params ---
     if algo == "fedgd":
         args.learning_rate = FEDGD_LR_PER_EPS.get(eps_f, 0.1)
+
+    elif algo == "ftrl":
+        args.use_ftrl      = True
+        args.learning_rate = FTRL_LR_PER_EPS.get(eps_f, 0.1)
+
+    elif algo == "adafedprox":
+        args.use_adafedprox        = True
+        args.fedprox_mu            = ADAFEDPROX_MU0_PER_EPS.get(eps_f, 0.01)
+        args.fedprox_local_steps   = ADAFEDPROX_LOCAL_STEPS_PER_EPS.get(eps_f, 5)
+        args.fedprox_client_lr     = ADAFEDPROX_CLIENT_LR_PER_EPS.get(eps_f, 0.1)
+        args.learning_rate         = ADAFEDPROX_LR_PER_EPS.get(eps_f, 1.0)
 
     elif algo == "fedfc":
         args.use_fedfc     = True
@@ -253,11 +285,16 @@ def make_args(algo, eps, rounds, seed, dataset, num_clients, partition_type,
         args.sofim_adaptive_params = False
         args.sofim_weight_decay = SOFIM_WEIGHT_DECAY
         if sofim_ablation_mode in ("ema_only", "grad_only"):
-            args.sofim_warmup_rounds = 0
+            args.sofim_warmup_rounds    = 0
+            args.sofim_warmup_use_ftrl  = False
             rho = SOFIM_RHO_PER_EPS.get(eps_f, 0.5)
             args.learning_rate = SOFIM_LR_PER_EPS.get(eps_f, 0.5) / rho
         else:
-            args.sofim_warmup_rounds = SOFIM_WARMUP_PER_EPS.get(eps_f, 0)
+            args.sofim_warmup_use_ftrl = SOFIM_WARMUP_USE_FTRL
+            if SOFIM_WARMUP_USE_FTRL:
+                args.sofim_warmup_rounds = SOFIM_FTRL_WARMUP_ROUNDS
+            else:
+                args.sofim_warmup_rounds = SOFIM_WARMUP_PER_EPS.get(eps_f, 0)
             args.learning_rate = SOFIM_LR_PER_EPS.get(eps_f, 0.5)
 
     # --- SOFIM defaults to avoid missing attr errors ---
@@ -268,7 +305,8 @@ def make_args(algo, eps, rounds, seed, dataset, num_clients, partition_type,
         args.sofim_disable_bias_correction = False
         args.sofim_adaptive_params         = False
         args.sofim_warmup_rounds           = 0
-        args.sofim_weight_decay = 0.0
+        args.sofim_warmup_use_ftrl         = False
+        args.sofim_weight_decay            = 0.0
 
     # --- FedNew-FC defaults ---
     args.fn_alpha    = FN_ALPHA
@@ -288,7 +326,11 @@ def make_args(algo, eps, rounds, seed, dataset, num_clients, partition_type,
     args.clients_per_round  = num_clients
     args.partition_type     = partition_type
     args.dirichlet_alpha    = DIRICHLET_ALPHA
-    args.classes_per_client = 2
+    # Tiny-ImageNet: 50-class random subset (fixed seed, agreed with supervisor)
+    args.tinyimagenet_classes     = 50
+    args.tinyimagenet_subset_seed = 0
+    # non_iid_classes: 10 classes/client → 20×10/50 = 4 owners per class (full coverage)
+    args.classes_per_client = 10 if dataset == "tinyimagenet" else 2
     args.local_iterations   = 1
     args.batch_size         = 64
     args.gradient_clip_norm = 10.0
@@ -326,10 +368,12 @@ def run_and_save(args, filepath, extra_config=None):
                 'seed':                args.seed,
                 'backbone':            args.backbone,
                 'learning_rate':       args.learning_rate,
-                'sofim_rho':           getattr(args, 'sofim_rho', None),
-                'sofim_beta':          getattr(args, 'sofim_beta', None),
-                'sofim_ablation_mode': getattr(args, 'sofim_ablation_mode', 'full'),
-                'sofim_weight_decay': getattr(args, 'sofim_weight_decay', 0.0),
+                'sofim_rho':              getattr(args, 'sofim_rho', None),
+                'sofim_beta':             getattr(args, 'sofim_beta', None),
+                'sofim_ablation_mode':    getattr(args, 'sofim_ablation_mode', 'full'),
+                'sofim_weight_decay':     getattr(args, 'sofim_weight_decay', 0.0),
+                'sofim_warmup_rounds':    getattr(args, 'sofim_warmup_rounds', 0),
+                'sofim_warmup_use_ftrl':  getattr(args, 'sofim_warmup_use_ftrl', False),
             }
             if extra_config:
                 results['sweep_config'].update(extra_config)
@@ -372,7 +416,7 @@ for algo in ACTIVE_ALGOS:
                 for eps in epsilons:
                     for rounds in rounds_list:
                         for seed in SEEDS:
-                            tag = (f"{algo}_{dataset}_"
+                            tag = (f"{algo.replace('/', '_')}_{dataset}_"
                                    f"c{num_clients}_{partition_type}_"
                                    f"eps{eps}_r{rounds}_seed{seed}")
                             filepath = os.path.join(results_dir, f"{tag}.json")

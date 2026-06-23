@@ -12,17 +12,17 @@ from train import run_dpfedgd_training, parse_args
 # CONFIGURATION
 # =============================================================================
 
-ALGORITHM = "fedavg"   # options: fedgd, sofim, fedfc, scaffold, fedadam, fedyogi
+ALGORITHM = "fedavg"   # options: fedgd, sofim, fedfc, scaffold, fedadam, fedyogi, ftrl, adafedprox
 STAGE     = "coarse"  # "coarse" first, then "fine" after reviewing coarse results
 
 # --- Fixed search config ---
-SEARCH_DATASET   = "pathmnist"
+SEARCH_DATASET   = "pathmnist"   # also: "cifar10", "tinyimagenet"
 SEARCH_CLIENTS   = 20
 SEARCH_PARTITION = "dirichlet"
 SEARCH_ALPHA     = 0.1
 SEARCH_SEED      = 42
 SEARCH_ROUNDS    = 50
-SEARCH_BACKBONE  = "cifar100_resnet20"
+SEARCH_BACKBONE  = "cifar100_resnet20"  # also: "cifar100_vgg16_bn"
 SEARCH_EPSILONS  = [0.5, 1, 5, 10]
 
 # --- Output directory ---
@@ -125,6 +125,30 @@ GRIDS = {
             "fedyogi_epsilon": [1e-3, 5e-3, 0.01, 0.05],
         },
     },
+
+    # DP-FTRL: only LR matters (tree aggregation + FTRL update; no extra knobs)
+    "ftrl": {
+        "coarse": {
+            "learning_rate": [0.001, 0.01, 0.1, 0.5, 1.0, 5.0],
+        },
+        "fine": {
+            "learning_rate": [0.05, 0.1, 0.3, 0.5, 1.0, 2.0],
+        },
+    },
+
+    # AdaFedProx: mu_0 (initial proximal), local steps, and LR
+    "adafedprox": {
+        "coarse": {
+            "learning_rate":        [0.01, 0.1, 0.5, 1.0, 5.0],
+            "fedprox_mu":           [0.001, 0.01, 0.1, 1.0],
+            "fedprox_local_steps":  [1, 3, 5],
+        },
+        "fine": {
+            "learning_rate":        [0.05, 0.1, 0.5, 1.0],
+            "fedprox_mu":           [0.005, 0.01, 0.05, 0.1],
+            "fedprox_local_steps":  [1, 3, 5, 7],
+        },
+    },
 }
 
 # =============================================================================
@@ -167,6 +191,8 @@ def make_args(eps, hparams):
     args.use_fedyogi            = False
     args.use_fedprox            = False
     args.use_sofim              = False
+    args.use_ftrl               = False
+    args.use_adafedprox         = False
     args.no_dp                  = False
 
     # Enable algorithm
@@ -203,12 +229,23 @@ def make_args(eps, hparams):
         args.fedyogi_beta2   = hparams.get("fedyogi_beta2", 0.99)
         args.fedyogi_epsilon = hparams.get("fedyogi_epsilon", 1e-3)
 
-    # SOFIM defaults to avoid missing attr errors
+    elif ALGORITHM == "ftrl":
+        args.use_ftrl = True
+
+    elif ALGORITHM == "adafedprox":
+        args.use_adafedprox       = True
+        args.fedprox_mu           = hparams.get("fedprox_mu", 0.01)
+        args.fedprox_local_steps  = hparams.get("fedprox_local_steps", 5)
+        args.fedprox_client_lr    = 0.1
+
+    # SOFIM / shared defaults to avoid missing-attr errors
     for attr, default in [
         ('sofim_rho', 0.5), ('sofim_beta', 0.9),
         ('sofim_ablation_mode', 'full'), ('sofim_warmup_rounds', 0),
         ('sofim_disable_bias_correction', False),
-        ('sofim_adaptive_params', False),
+        ('sofim_adaptive_params', False), ('sofim_weight_decay', 0.0),
+        ('fedprox_mu', 0.01), ('fedprox_local_steps', 5),
+        ('fedprox_client_lr', 0.1),
     ]:
         if not hasattr(args, attr):
             setattr(args, attr, default)
@@ -225,7 +262,10 @@ def make_args(eps, hparams):
     args.clients_per_round  = SEARCH_CLIENTS
     args.partition_type     = SEARCH_PARTITION
     args.dirichlet_alpha    = SEARCH_ALPHA
-    args.classes_per_client = 2
+    # Tiny-ImageNet: 50-class random subset, fixed seed
+    args.tinyimagenet_classes     = 50
+    args.tinyimagenet_subset_seed = 0
+    args.classes_per_client = 10 if SEARCH_DATASET == "tinyimagenet" else 2
     args.local_iterations   = 1
     args.batch_size         = 64
     args.gradient_clip_norm = 10.0

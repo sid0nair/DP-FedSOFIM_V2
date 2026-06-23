@@ -38,7 +38,8 @@ def parse_args():
     model_group.add_argument(
         "--backbone", type=str, default="cifar100_resnet20",
         choices=["resnet20", "resnet32", "resnet44", "resnet56",
-                 "cifar100_resnet20", "cifar100_resnet56"],
+                 "cifar100_resnet20", "cifar100_resnet56",
+                 "cifar100_vgg16_bn"],
         help="Frozen feature extractor backbone (chenyaofo CIFAR-pretrained, 32x32 input)"
     )
     model_group.add_argument(
@@ -60,6 +61,7 @@ def parse_args():
             "pathmnist",
             "bloodmnist",
             "dermamnist",
+            "tinyimagenet",
         ],
         help="Dataset to use for federated training."
     )
@@ -196,13 +198,24 @@ def parse_args():
                    help="Yogi epsilon; also sets v_0=eps^2")
 
     p.add_argument("--use_fedprox", action="store_true",
-                   help="Use DP-FedProx with proximal penalty")
+                   help="Use DP-FedProx with fixed proximal penalty")
+    p.add_argument("--use_adafedprox", action="store_true",
+                   help="Use DP-AdaFedProx with diminishing proximal mu_t = mu_0/sqrt(t)")
     p.add_argument("--fedprox_mu", type=float, default=0.01,
-                   help="Proximal penalty coefficient mu for FedProx")
+                   help="Initial proximal penalty mu_0 (FedProx / AdaFedProx)")
     p.add_argument("--fedprox_local_steps", type=int, default=5,
-                   help="Number of local steps K for FedProx")
+                   help="Number of local steps K for FedProx / AdaFedProx")
     p.add_argument("--fedprox_client_lr", type=float, default=0.1,
-                   help="Local learning rate for FedProx")
+                   help="Local learning rate for FedProx / AdaFedProx")
+
+    p.add_argument("--use_ftrl", action="store_true",
+                   help="Use DP-FTRL with binary tree aggregation (Kairouz et al., ICML 2021)")
+
+    # Tiny-ImageNet subset
+    p.add_argument("--tinyimagenet_classes", type=int, default=50,
+                   help="Number of classes from Tiny-ImageNet (default 50).")
+    p.add_argument("--tinyimagenet_subset_seed", type=int, default=0,
+                   help="Seed for Tiny-ImageNet class subset selection (default 0).")
 
     # === Differential Privacy ===
     privacy_group = p.add_argument_group('Differential Privacy')
@@ -322,6 +335,7 @@ def validate_args(args) -> None:
             "pathmnist": 9,
             "bloodmnist": 8,
             "dermamnist": 7,
+            "tinyimagenet": getattr(args, "tinyimagenet_classes", 50),
         }
         max_classes = max_classes_by_dataset.get(args.dataset, 10)
 
@@ -558,6 +572,8 @@ def save_experiment_results(args, results: Dict[str, Any], metrics: Dict[str, fl
         "fedadam" if getattr(args, 'use_fedadam', False) else
         "fedyogi" if getattr(args, 'use_fedyogi', False) else
         f"fedprox_k{args.fedprox_local_steps}" if getattr(args, 'use_fedprox', False) else
+        f"adafedprox_k{args.fedprox_local_steps}" if getattr(args, 'use_adafedprox', False) else
+        "dp_ftrl" if getattr(args, 'use_ftrl', False) else
         "fedgd"
     )
     filename = (f"{algo_tag}_{args.dataset}_{args.backbone}_{args.partition_type}_"
@@ -684,6 +700,8 @@ def main():
                 "FedAdam" if getattr(args, 'use_fedadam', False) else
                 "FedYogi" if getattr(args, 'use_fedyogi', False) else
                 f"FedProx-K{args.fedprox_local_steps}-mu{args.fedprox_mu}" if getattr(args, 'use_fedprox', False) else
+                f"AdaFedProx-K{args.fedprox_local_steps}" if getattr(args, 'use_adafedprox', False) else
+                "DP-FTRL" if getattr(args, 'use_ftrl', False) else
                 "FedGD"
             )
             if getattr(args, 'no_dp', False):

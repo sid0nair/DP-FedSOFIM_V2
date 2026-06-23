@@ -408,6 +408,54 @@ class DPFedNewSanitizer:
         return self.epsilon, self.delta
 
 
+class DPFedFTRLSanitizer(DPFedGDSanitizer):
+    """
+    Sanitizer for DP-FTRL with binary tree aggregation.
+
+    Kairouz et al., "Practical and Private (Deep) Learning without Auditing",
+    ICML 2021.
+
+    Key idea: in the tree mechanism each training example's gradient participates
+    in at most ceil(log2(T)) + 1 tree nodes instead of T.  Privacy therefore
+    composes over only T_eff = ceil(log2(T)) + 1 rounds, allowing a noise
+    multiplier that is sqrt(T / T_eff) ≈ sqrt(T / log2(T)) smaller than
+    standard DP-FedGD for the same (epsilon, delta) budget.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._t_effective = math.ceil(math.log2(max(self.federated_rounds, 2))) + 1
+
+    def calibrate_noise(self, target_epsilon: float, target_delta: float):
+        """Calibrate noise to T_eff compositions (tree accounting)."""
+        self.epsilon = target_epsilon
+        self.delta = target_delta
+
+        if target_epsilon >= 500.0:
+            self.sigma_g = 1e-10
+            return
+
+        # Replace the accountant with one that uses T_eff instead of T.
+        # This is the DP guarantee of the tree mechanism: T rounds with
+        # tree-structured noise achieve the same (eps, delta) as T_eff
+        # sequential Gaussian compositions.
+        self.hockey_accountant = RecordLevelDPFedGDAccountant(
+            C_g=self.gradient_clip_norm,
+            n_clients=self.clients_per_round,
+            T_rounds=self._t_effective,
+            dataset_size=self.dataset_size,
+            neighbor_type="replace_one",
+        )
+        self.sigma_g = self.hockey_accountant.calibrate_noise(
+            epsilon_target=target_epsilon,
+            delta_target=target_delta,
+        )
+        noise_reduction = (self.federated_rounds / self._t_effective) ** 0.5
+        print(f"  [DP-FTRL] T={self.federated_rounds}, "
+              f"T_eff={self._t_effective}, "
+              f"noise reduction ≈ {noise_reduction:.2f}x vs DP-FedGD")
+
+
 class DPFedFCSanitizer(DPFedGDSanitizer):
     """
     Sanitizer for Record-level DP-FedFC.
