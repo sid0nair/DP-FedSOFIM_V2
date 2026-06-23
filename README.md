@@ -1,6 +1,6 @@
-# DP-FedSOFIM: Differentially Private Federated Learning with Second-Order Fisher Information Matrix Optimization
+# DP-FedSOFIM: Differentially Private Federated Stochastic Optimization using Regularized Fisher Information Matrix
 
-This repository contains the official implementation accompanying the paper **"DP-FedSOFIM"**. It provides a unified codebase for training differentially private federated learning models using second-order optimization (SOFIM) and a suite of baseline algorithms, with exact privacy accounting via the hockey-stick divergence.
+This repository contains the official implementation accompanying the paper **"DP-FedSOFIM"**, accepted at **TMLR (2026)**. It provides a unified codebase for training differentially private federated learning models using second-order optimization (SOFIM) and a suite of baseline algorithms, with exact privacy accounting via the hockey-stick divergence.
 
 ---
 
@@ -9,7 +9,7 @@ This repository contains the official implementation accompanying the paper **"D
 DP-FedSOFIM trains a linear classifier on top of a frozen, pre-trained ResNet backbone in a federated setting under record-level differential privacy. The key contribution is the **SOFIM server optimizer**, which applies a Sherman-Morrison Newton step on the aggregated noisy gradients — achieving second-order convergence at O(d) cost, the same as SGD with momentum.
 
 **Architecture:**
-- **Backbone** (frozen): CIFAR-pretrained ResNet (chenyaofo), producing 64-dimensional features
+- **Backbones** (frozen): CIFAR-100-pretrained ResNet-20 and VGG-16 (chenyaofo), producing low-dimensional features
 - **Head** (trained federally): Linear classifier
 - **Privacy**: Gaussian mechanism with per-example gradient clipping; noise calibrated via exact hockey-stick divergence accounting
 
@@ -94,6 +94,8 @@ python main.py \
 | `--use_fedadam` | DP-FedAdam | Server-side Adam optimizer |
 | `--use_fedyogi` | DP-FedYogi | Server-side Yogi optimizer (Reddi et al., 2021) |
 | `--use_fedprox` | DP-FedProx | Proximal penalty regularization |
+| `--use_ftrl` | DP-FTRL | Tree-aggregation based privacy accounting |
+| `--use_adafedprox` | DP-AdaFedProx | Heterogeneity-robust adaptive proximal method |
 
 ---
 
@@ -107,6 +109,7 @@ python main.py \
 | BloodMNIST | `--dataset bloodmnist` | 8 | RGB, requires `medmnist` |
 | DermaMNIST | `--dataset dermamnist` | 7 | RGB, requires `medmnist` |
 | ChestMNIST | `--dataset chestmnist` | 15 | Grayscale→3ch, multi-label→single-label |
+| Tiny-ImageNet | `--dataset tinyimagenet` | 200 | Scalability/runtime evaluation |
 
 ---
 
@@ -119,6 +122,8 @@ Three federated data distribution strategies are supported via `--partition_type
 | IID | `iid` | Uniform random split across clients |
 | Non-IID (class-based) | `non_iid_classes` | Each client receives `--classes_per_client` classes |
 | Non-IID (Dirichlet) | `dirichlet` | Label distribution drawn from Dir(α); lower α = more heterogeneous |
+
+Non-IID Dirichlet (α = 0.5) is the primary evaluation setting in the paper. Per-client, per-class partition statistics for CIFAR-10 and PathMNIST are reported in Appendix I of the paper.
 
 ---
 
@@ -145,7 +150,7 @@ Three federated data distribution strategies are supported via `--partition_type
 |---|---|---|
 | `--sofim_rho` | 0.5 | FIM regularization ρ > 0 |
 | `--sofim_beta` | 0.9 | EMA momentum β ∈ [0, 1) |
-| `--sofim_warmup_rounds` | 0 | Rounds of SGD warmup before enabling SOFIM |
+| `--sofim_warmup_rounds` | 20 | Rounds of EMA-only warmup before enabling Sherman-Morrison preconditioning (stabilizes early rounds under tight ε) |
 | `--sofim_ablation_mode` | `full` | `full` / `ema_only` / `grad_only` |
 | `--sofim_disable_bias_correction` | — | Disable bias correction (recommended for ε < 2) |
 
@@ -153,24 +158,9 @@ Three federated data distribution strategies are supported via `--partition_type
 
 ## Reproducing Paper Experiments
 
-### Full experiment sweep
+The full sweep and hyperparameter search runners (`run_dp_fedgd_experiments.py`, `run_hyperparam_search.py`) used internally for the paper have been removed from this repo. To reproduce a specific configuration, call `main.py` directly with the desired flags (see Key Arguments above), or write a thin wrapper script that loops over `--epsilon`, `--use_*`, and `--seed` values and calls `main.py` with `--save_results`.
 
-Edit the configuration block at the top of [run_dp_fedgd_experiments.py](run_dp_fedgd_experiments.py) to select algorithms, datasets, epsilon values, and rounds, then run:
-
-```bash
-python run_dp_fedgd_experiments.py
-```
-
-Results are saved as JSON files to the configured `results_dir`.
-
-### Hyperparameter search
-
-```bash
-# Set ALGORITHM and STAGE at the top of run_hyperparam_search.py, then:
-python run_hyperparam_search.py
-```
-
-Runs a coarse-then-fine grid search. After the coarse stage, update `FINE_OVERRIDE` with the best per-ε parameters and re-run with `STAGE = "fine"`.
+Results are saved as JSON files to the directory set by `--results_dir`.
 
 ### Plotting
 
@@ -187,7 +177,7 @@ Privacy is tracked using an exact hockey-stick divergence accountant ([hockey_st
 
 $$\delta(\varepsilon) = \Phi\!\left(-\frac{\varepsilon\sigma}{\sqrt{T}\Delta} + \frac{\sqrt{T}\Delta}{2\sigma}\right) - e^{\varepsilon}\,\Phi\!\left(-\frac{\varepsilon\sigma}{\sqrt{T}\Delta} - \frac{\sqrt{T}\Delta}{2\sigma}\right)$$
 
-Noise multiplier σ_g is calibrated via binary search to meet the target (ε, δ) budget before training begins.
+Noise multiplier σ_g is calibrated via binary search to meet the target (ε, δ) budget before training begins. DP-FedSOFIM incurs no additional privacy cost beyond the underlying privatized gradient release mechanism, since all curvature and preconditioning operations are server-side post-processing on already-privatized gradients.
 
 ---
 
@@ -210,9 +200,22 @@ The Sherman-Morrison step avoids forming the d×d Fisher matrix explicitly, keep
 
 ---
 
+## Evaluation Summary
+
+The paper evaluates DP-FedSOFIM against eight baselines (DP-FedGD, DP-FedAvg, DP-SCAFFOLD, DP-FedFC, DP-FedAdam, DP-FedYogi, DP-FTRL, DP-AdaFedProx) across:
+- Two datasets: CIFAR-10 and PathMNIST
+- Two backbones: ResNet-20 and VGG-16
+- Non-IID Dirichlet (α = 0.5) partitioning, 20 clients
+- Four privacy budgets: ε ∈ {0.5, 1, 5, 10}
+- Three random seeds, with McNemar's test for statistical significance
+
+DP-FedSOFIM matches or leads the best competing method at the final round in the large majority of these settings, with the Sherman-Morrison preconditioning step providing its largest gains at moderate-to-high privacy noise (ε ≈ 1–5), where curvature estimation is reliable but isotropic gradient steps are still noise-degraded.
+
+---
+
 ## Reproducibility
 
-All experiments use a fixed random seed (`--seed 42` by default). To fully reproduce results:
+All experiments use fixed random seeds (3 seeds per configuration; `--seed 42` as the default). To reproduce a single run:
 
 ```bash
 python main.py --seed 42 --backbone cifar100_resnet20 --dataset pathmnist \
@@ -229,14 +232,13 @@ python main.py --seed 42 --backbone cifar100_resnet20 --dataset pathmnist \
 If you use this code, please cite the accompanying paper:
 
 ```bibtex
-@article{anonymous2026dpfedsofim,
+@article{nair2026dpfedsofim,
   title   = {{DP}-Fed{SOFIM}: Differentially Private Federated Stochastic Optimization
              using Regularized Fisher Information Matrix},
-  author  = {Anonymous},
-  journal = {Submitted to Transactions on Machine Learning Research},
+  author  = {Nair, Sidhant and Sen, Tanmay and Sen, Mrinmay and Banerjee, Sayantan},
+  journal = {Transactions on Machine Learning Research},
   year    = {2026},
-  url     = {https://openreview.net/forum?id=aDzj9DrwAR},
-  note    = {Under review}
+  url     = {https://openreview.net/forum?id=aDzj9DrwAR}
 }
 ```
 
