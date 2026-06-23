@@ -241,3 +241,11 @@ If you use this code, please cite the accompanying paper:
   note    = {Under review}
 }
 ```
+
+---
+
+## License
+Copyright (c) 2026 Sidhant Nair
+
+Licensed under the Apache License, Version 2.0.
+See the LICENSE file for details.
